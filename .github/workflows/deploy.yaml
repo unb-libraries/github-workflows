@@ -1,0 +1,136 @@
+name: Deploy an Image to Kubernetes
+
+on:
+  workflow_call:
+    inputs:
+      branch-env-map:
+        description: 'A mapping of branches-to-k8s-namespaces. JSON dictionary format.'
+        required: true
+        type: string
+      deploy-branches:
+        description: 'A list of branches that should be deployed to kubernetes cluster. JSON list format.'
+        required: true
+        type: string
+      k8s-deployment-name:
+        description: 'The name(s) of the kubernetes deployment(s) to update. Supports CSV for multiple deployments (e.g., "deploy1,deploy2"). Each name must equal its pod container name.'
+        required: true
+        type: string
+      image-full-name:
+        description: 'The full <image>:<tag> reference to deploy, as produced by build-push.yaml''s image-full-name output.'
+        required: true
+        type: string
+      collect-logs:
+        description: >-
+          Collect post-rollout container logs and upload them as the deployment-logs
+          artifact. Adds a 60s settle wait before reading. Default false.
+        required: false
+        type: boolean
+        default: false
+      rollout-timeout:
+        description: >-
+          Timeout passed to `kubectl rollout status`. Without one, an image that
+          CrashLoopBackOffs blocks the job until GitHub''s 6-hour ceiling instead of
+          failing. Default 10m.
+        required: false
+        type: string
+        default: '10m'
+    secrets:
+      KUBE_CONFIG:
+        required: true
+
+jobs:
+  deploy-image-to-k8s:
+    if:
+      contains(fromJSON(inputs.deploy-branches), github.ref_name)
+    name: Deploy New Image to Kubernetes Cluster
+    runs-on: ubuntu-latest
+    steps:
+      -
+        name: Write Deployment Namespaces To Local
+        run: echo '${{ inputs.branch-env-map }}' > /tmp/deployment_namespaces.json
+      -
+        name: Set Deployment Namespace
+        run: echo "DEPLOYMENT_NAMESPACE=$(jq -r '.["${{ github.ref_name }}"]' /tmp/deployment_namespaces.json)" >> $GITHUB_ENV
+      - uses: azure/setup-kubectl@v5
+        name: Install Kubectl
+        with:
+          version: 'v1.31.0'
+        id: install-kubectl
+      - uses: azure/k8s-set-context@v5
+        name: Set Kubectl Context
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBE_CONFIG }}
+        id: setcontext-kubectl
+      -
+        name: Deploy Image to Kubernetes
+        run: |
+          FAILED_DEPLOYMENTS=""
+          IFS=',' read -ra DEPLOYMENTS <<< "$DEPLOYMENT_NAMES"
+          for DEPLOY_NAME in "${DEPLOYMENTS[@]}"; do
+            DEPLOY_NAME=$(echo "$DEPLOY_NAME" | xargs)
+            [ -z "$DEPLOY_NAME" ] && continue
+
+            echo "::group::Deploying $DEPLOY_NAME"
+            if ! (
+              set -e
+              kubectl set image "deployment/$DEPLOY_NAME" "$DEPLOY_NAME=$DEPLOYMENT_IMAGE" \
+                --namespace="$DEPLOYMENT_NAMESPACE"
+
+              ORIGINAL_REPLICAS=$(kubectl get deployment "$DEPLOY_NAME" \
+                --namespace="$DEPLOYMENT_NAMESPACE" \
+                -o jsonpath='{.metadata.annotations.downscaler/original-replicas}' || echo "")
+              if [ -n "$ORIGINAL_REPLICAS" ]; then
+                # In the case where a deployment wasn't scaled down YET, the scaling command is essentially a no-op but the TTL clock is reset.
+                kubectl annotate deployment "$DEPLOY_NAME" \
+                  deployment-time="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                  --namespace="$DEPLOYMENT_NAMESPACE" --overwrite
+                kubectl scale deployment "$DEPLOY_NAME" \
+                  --replicas=$ORIGINAL_REPLICAS --namespace="$DEPLOYMENT_NAMESPACE"
+              fi
+
+              kubectl rollout status deployment "$DEPLOY_NAME" \
+                --namespace="$DEPLOYMENT_NAMESPACE" \
+                --timeout="$ROLLOUT_TIMEOUT"
+            ); then
+              echo "::error::Deployment of $DEPLOY_NAME failed!"
+              FAILED_DEPLOYMENTS="$FAILED_DEPLOYMENTS $DEPLOY_NAME"
+            fi
+            echo "::endgroup::"
+          done
+
+          if [ -n "$FAILED_DEPLOYMENTS" ]; then
+            echo "::error::The following deployments failed:$FAILED_DEPLOYMENTS"
+            exit 1
+          fi
+        env:
+          DEPLOYMENT_IMAGE: ${{ inputs.image-full-name }}
+          DEPLOYMENT_NAMES: ${{ inputs.k8s-deployment-name }}
+          DEPLOYMENT_NAMESPACE: ${{ env.DEPLOYMENT_NAMESPACE }}
+          ROLLOUT_TIMEOUT: ${{ inputs.rollout-timeout }}
+      -
+        name: Write deployment logs
+        if: ${{ always() && inputs.collect-logs }}
+        run: |
+          sleep 60
+          IFS=',' read -ra DEPLOYMENTS <<< "$DEPLOYMENT_NAMES"
+          for DEPLOY_NAME in "${DEPLOYMENTS[@]}"; do
+            DEPLOY_NAME=$(echo "$DEPLOY_NAME" | xargs)
+            [ -z "$DEPLOY_NAME" ] && continue
+            if [ ${#DEPLOYMENTS[@]} -gt 1 ]; then
+              echo "=== Logs for deployment/$DEPLOY_NAME ===" >> /tmp/deployment_logs.txt
+            fi
+            kubectl logs "deployment/$DEPLOY_NAME" \
+              --namespace="$DEPLOYMENT_NAMESPACE" >> /tmp/deployment_logs.txt 2>&1
+          done
+        env:
+          DEPLOYMENT_NAMES: ${{ inputs.k8s-deployment-name }}
+          DEPLOYMENT_NAMESPACE: ${{ env.DEPLOYMENT_NAMESPACE }}
+      -
+        name: Archive Deployment Logs
+        if: ${{ always() && inputs.collect-logs }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: deployment-logs
+          path: /tmp/deployment_logs.txt
+          retention-days: 7

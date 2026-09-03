@@ -1,0 +1,137 @@
+name: Build Image and Push, then Deploy to Kubernetes
+
+on:
+  workflow_call:
+    inputs:
+      branch-env-map:
+        description: 'A mapping of branches-to-k8s-namespaces. JSON dictionary format.'
+        required: true
+        type: string
+      deploy-branches:
+        description: 'A list of branches that should be deployed to kubernetes cluster. JSON list format.'
+        required: true
+        type: string
+      image-name:
+        description: 'The full, repository namespaced image name to build (without the tag).'
+        required: true
+        type: string
+      k8s-deployment-name:
+        description: 'The name(s) of the kubernetes deployment(s) to update. Supports CSV for multiple deployments (e.g., "deploy1,deploy2"). Each name must equal its pod container name.'
+        required: true
+        type: string
+      pre-build-command:
+        description: 'Optional shell command run in the repository root before the image build. See build-push.yaml.'
+        required: false
+        type: string
+        default: ''
+      platforms:
+        description: "A comma-separated list of platforms."
+        required: false
+        type: string
+        default: linux/amd64,linux/arm64/v8
+      build-cache:
+        description: 'Read and write a BuildKit layer cache in the calling repository''s Actions cache. Default true.'
+        required: false
+        type: boolean
+        default: true
+      docker-build-record-retention-days:
+        description: 'Number of days to retain Docker build records.'
+        required: false
+        type: number
+        default: 3
+      checkout-fetch-depth:
+        description: 'fetch-depth for the build-push source checkout. Default 1 (shallow). Set 0 for full history when the build needs it (e.g. git-based last-updated dates).'
+        required: false
+        type: number
+        default: 1
+      collect-logs:
+        description: 'Collect post-rollout container logs and upload them as the deployment-logs artifact. Default false.'
+        required: false
+        type: boolean
+        default: false
+      rollout-timeout:
+        description: 'Timeout passed to `kubectl rollout status`. Default 10m.'
+        required: false
+        type: string
+        default: '10m'
+      dockerfile:
+        description: 'Path to the Dockerfile, relative to the repository root. Default empty, which lets buildx use "<build-context>/Dockerfile".'
+        required: false
+        type: string
+        default: ''
+      build-context:
+        description: 'The Docker build context, relative to the repository root. Default ".". Note that .dockerignore is read from inside the context directory, so a root .dockerignore does not apply to a subdirectory context.'
+        required: false
+        type: string
+        default: '.'
+    secrets:
+      KUBE_CONFIG:
+        required: true
+      SLACK_WEBHOOK_URL:
+        required: true
+      GH_CONTAINER_REGISTRY_USER:
+        required: true
+      GH_CONTAINER_REGISTRY_TOKEN:
+        required: true
+
+jobs:
+  notify-start:
+    name: Notify Start
+    if: always()
+    uses: unb-libraries/github-workflows/.github/workflows/notify-start.yaml@1.x
+    secrets:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  build-push-images:
+    name: Build/Push Images
+    uses: unb-libraries/github-workflows/.github/workflows/build-push.yaml@1.x
+    with:
+      image-name: ${{ inputs.image-name }}
+      pre-build-command: ${{ inputs.pre-build-command }}
+      platforms: ${{ inputs.platforms }}
+      build-cache: ${{ inputs.build-cache }}
+      docker-build-record-retention-days: ${{ inputs.docker-build-record-retention-days }}
+      checkout-fetch-depth: ${{ inputs.checkout-fetch-depth }}
+      dockerfile: ${{ inputs.dockerfile }}
+      build-context: ${{ inputs.build-context }}
+    secrets:
+      GH_CONTAINER_REGISTRY_USER: ${{ secrets.GH_CONTAINER_REGISTRY_USER }}
+      GH_CONTAINER_REGISTRY_TOKEN: ${{ secrets.GH_CONTAINER_REGISTRY_TOKEN }}
+
+  deploy-image-to-k8s:
+    name: Deploy New Image
+    uses: unb-libraries/github-workflows/.github/workflows/deploy.yaml@1.x
+    needs: [ build-push-images ]
+    with:
+      branch-env-map: ${{ inputs.branch-env-map }}
+      deploy-branches: ${{ inputs.deploy-branches }}
+      k8s-deployment-name: ${{ inputs.k8s-deployment-name }}
+      image-full-name: ${{ needs.build-push-images.outputs.image-full-name }}
+      collect-logs: ${{ inputs.collect-logs }}
+      rollout-timeout: ${{ inputs.rollout-timeout }}
+    secrets:
+      KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+
+  prune-old-images:
+    name: Prune Old Images
+    needs: [ deploy-image-to-k8s ]
+    if: ${{ success() && contains(fromJSON(inputs.deploy-branches), github.ref_name) }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    concurrency:
+      group: prune-${{ inputs.image-name }}
+      cancel-in-progress: false
+    steps:
+      - uses: unb-libraries/container-image-pruner@v1
+        with:
+          image-name: ${{ inputs.image-name }}
+          token: ${{ secrets.GH_CONTAINER_REGISTRY_TOKEN }}
+          max-delete: 1500
+
+  notify-conclusion:
+    name: Notify Conclusion
+    uses: unb-libraries/github-workflows/.github/workflows/notify-conclusion.yaml@1.x
+    needs: [ deploy-image-to-k8s ]
+    if: always()
+    secrets:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

@@ -1,0 +1,210 @@
+name: Build Image and Push To Registry
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: 'The full, repository namespaced image name to build (without the tag).'
+        required: true
+        type: string
+      pre-build-command:
+        description: >-
+          Optional shell command run in the repository root before the image build, e.g. an
+          asset or theme build. Runs under bash with the repository checked out. Default
+          empty, which skips the step entirely.
+        required: false
+        type: string
+        default: ''
+      platforms:
+        description: "A comma-separated list of platforms to build images for. See https://docs.docker.com/engine/reference/commandline/buildx_build/#platform for supported values."
+        required: false
+        type: string
+        default: linux/amd64,linux/arm64/v8
+      build-cache:
+        description: >-
+          Read and write a BuildKit layer cache in the GitHub Actions cache. Default true.
+          The cache is scoped to the CALLING repository, so it never mixes across repos, but
+          it does consume that repository's 10GB Actions cache budget. Set false for a
+          repository whose other caches matter more, or whose image gains nothing from
+          layer reuse.
+        required: false
+        type: boolean
+        default: true
+      docker-build-record-retention-days:
+        description: 'Number of days to retain Docker build records.'
+        required: false
+        type: number
+        default: 3
+      checkout-fetch-depth:
+        description: 'fetch-depth for the source checkout. Default 1 (shallow). Set 0 for full history when the build needs it (e.g. git-based last-updated dates).'
+        required: false
+        type: number
+        default: 1
+      dockerfile:
+        description: 'Path to the Dockerfile, relative to the repository root. Default empty, which lets buildx use "<build-context>/Dockerfile". Set this when the Dockerfile lives outside the build context or is not named Dockerfile.'
+        required: false
+        type: string
+        default: ''
+      build-context:
+        description: 'The Docker build context, relative to the repository root. Default ".". Set this when the image is built from a subdirectory. Note that .dockerignore is read from inside the context directory, so a root .dockerignore does not apply to a subdirectory context.'
+        required: false
+        type: string
+        default: '.'
+
+    outputs:
+      image-tag:
+        description: 'The immutable <short-sha>-<timestamp> tag that was pushed.'
+        value: ${{ jobs.build-image.outputs.image-tag }}
+      image-full-name:
+        description: 'The full <image-name>:<tag> reference that was pushed.'
+        value: ${{ jobs.build-image.outputs.image-full-name }}
+
+    secrets:
+      GH_CONTAINER_REGISTRY_USER:
+        description: 'The user to use to login to the GitHub Container Registry.'
+        required: true
+      GH_CONTAINER_REGISTRY_TOKEN:
+        description: 'The token to use to login to the GitHub Container Registry.'
+        required: true
+
+jobs:
+  build-image:
+    name: Build Image
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.image-tag.outputs.image-tag }}
+      image-full-name: ${{ steps.image-tag.outputs.image-full-name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: ${{ inputs.checkout-fetch-depth }}
+      -
+        name: Validate Build Paths
+        env:
+          BUILD_CONTEXT: ${{ inputs.build-context }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: |
+          set -euo pipefail
+          # Fail here rather than inside buildx, which would only surface the problem after
+          # the pre-build command has run.
+          context="${BUILD_CONTEXT:-.}"
+          [ -n "$context" ] || context="."
+          # An empty dockerfile input is passed to the action as-is, so buildx applies its
+          # own "<context>/Dockerfile" default. Resolve it here only to validate.
+          resolved="${DOCKERFILE:-}"
+          [ -n "$resolved" ] || resolved="$context/Dockerfile"
+          if [ ! -d "$context" ]; then
+            echo "::error title=Invalid build-context::build-context '$context' is not a directory in this repository."
+            exit 1
+          fi
+          if [ ! -f "$resolved" ]; then
+            echo "::error title=Missing Dockerfile::No Dockerfile found at '$resolved'. Set the 'dockerfile' input if it lives elsewhere in the repository."
+            exit 1
+          fi
+          echo "Building '$resolved' with context '$context'"
+        shell: bash
+      -
+        name: Resolve Image Tags
+        id: image-tag
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${GITHUB_SHA::7}"
+          TIMESTAMP="$(date -u +%Y%m%d%H%M%S)"
+          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          TAG="$SHORT_SHA-$TIMESTAMP"
+
+          # Sanitize the branch name into a valid Docker tag: replace any character outside
+          # [A-Za-z0-9_.-] with '-', strip leading '.'/'-', cap at 128 chars. Preserves case
+          # and dots so e.g. '11.x' stays '11.x' while 'feature/x' becomes 'feature-x'.
+          SAFE_REF="$(printf '%s' "$REF_NAME" | sed -E 's/[^A-Za-z0-9_.-]+/-/g; s/^[.-]+//' | cut -c1-128)"
+
+          {
+            echo "image-tag=$TAG"
+            echo "image-full-name=$IMAGE_NAME:$TAG"
+            echo "build-date=$BUILD_DATE"
+            echo "branch-tag=${SAFE_REF:+$IMAGE_NAME:$SAFE_REF}"
+          } >> "$GITHUB_OUTPUT"
+
+          # CONTRACT: this file's flat KEY=VALUE format and the build-image-tag artifact
+          # name below are consumed by repositories that call this workflow standalone.
+          # deploy.yaml in this repository reads the workflow outputs instead. See
+          # .github/workflows/README.md before changing either.
+          {
+            echo "BUILD_IMAGE_TAG=$TAG"
+            echo "BUILD_IMAGE_FULL_NAME=$IMAGE_NAME:$TAG"
+          } > /tmp/image_tag.env
+
+          echo "Resolved image: $IMAGE_NAME:$TAG"
+        shell: bash
+      -
+        # The replacement for the old build-themes step. Deliberately reachable only through
+        # workflow_call: this interpolates into a run: block, so it must never be settable
+        # from a workflow_dispatch form.
+        name: Pre-build command
+        if: inputs.pre-build-command != ''
+        run: ${{ inputs.pre-build-command }}
+        shell: bash
+      -
+        name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v4
+      -
+        name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.GH_CONTAINER_REGISTRY_USER }}
+          password: ${{ secrets.GH_CONTAINER_REGISTRY_TOKEN }}
+      -
+        name: Determine Push Tags
+        id: fetch-push-tags
+        env:
+          HASH_NAME: ${{ steps.image-tag.outputs.image-full-name }}
+          BRANCH_NAME: ${{ steps.image-tag.outputs.branch-tag }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          # The unique hash-time image is always pushed.
+          tags="$HASH_NAME"
+
+          # Branch tag only on real branch pushes / manual dispatch (event allowlist; never
+          # PR or pull_request_target refs), and only when the sanitized branch name is non-empty.
+          if { [ "$EVENT_NAME" = "push" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; } \
+             && [ "$REF_TYPE" = "branch" ] && [ -n "$BRANCH_NAME" ]; then
+            tags="$HASH_NAME,$BRANCH_NAME"
+          fi
+
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "Resolved push tags: $tags"
+        shell: bash
+      -
+        env:
+          DOCKER_BUILD_RECORD_RETENTION_DAYS: ${{ inputs.docker-build-record-retention-days }}
+        uses: docker/build-push-action@v7
+        with:
+          provenance: false
+          pull: true
+          push: true
+          platforms: ${{ inputs.platforms }}
+          # `context` must never be empty: build-push-action then falls back to the remote
+          # git context, which silently discards workspace changes (e.g. anything the
+          # pre-build command produced).
+          context: ${{ inputs.build-context || '.' }}
+          file: ${{ inputs.dockerfile }}
+          tags: ${{ steps.fetch-push-tags.outputs.tags }}
+          cache-from: ${{ inputs.build-cache && 'type=gha' || '' }}
+          cache-to: ${{ inputs.build-cache && 'type=gha,mode=max' || '' }}
+          build-args: |
+            BUILD_DATE=${{ steps.image-tag.outputs.build-date }}
+            VCS_REF=${{ github.ref_name }}
+            VERSION=${{ steps.image-tag.outputs.image-tag }}
+      -
+        # CONTRACT: see the note in Resolve Image Tags above.
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-image-tag
+          path: /tmp/image_tag.env
