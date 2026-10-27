@@ -15,7 +15,8 @@ here requires PHP, composer, or the dockworker package.
 | Workflow | Use |
 |---|---|
 | `build-push.yaml` | Build and push an image. Called directly, or via an orchestrator below. |
-| `build-push-notify.yaml` | Build/push, with Slack start + conclusion notifications. |
+| `publish-image.yaml` | Build/push, with Slack start + conclusion notifications, and no deploy. For base and service images that other repositories consume. |
+| `build-push-notify.yaml` | **Deprecated** (remove in 2.x): wraps `publish-image.yaml` unchanged. Repoint `uses:` to `publish-image.yaml`; inputs and secrets are identical. |
 | `build-push-deploy-notify.yaml` | Build/push, deploy to Kubernetes, prune, notify. The common case. |
 
 Supporting workflows (`deploy.yaml`, `notify-start.yaml`, `notify-conclusion.yaml`) are
