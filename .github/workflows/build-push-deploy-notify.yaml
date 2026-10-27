@@ -64,6 +64,26 @@ on:
         required: false
         type: string
         default: '.'
+      distribute:
+        description: 'Build each platform in its own job on a native runner, then merge them. Set false to build every platform in one job under emulation. See build-push.yaml.'
+        required: false
+        type: boolean
+        default: true
+      arm64-runner:
+        description: 'Runner label for linux/arm64 builds when distribute is true.'
+        required: false
+        type: string
+        default: ubuntu-24.04-arm
+      amd64-runner:
+        description: 'Runner label for linux/amd64 builds and emulated platforms.'
+        required: false
+        type: string
+        default: ubuntu-latest
+      compression:
+        description: 'Layer compression: "zstd" (default) or "gzip". zstd requires containerd 1.5+ / Docker 23+ wherever the image is pulled.'
+        required: false
+        type: string
+        default: zstd
     secrets:
       KUBE_CONFIG:
         required: true
@@ -94,6 +114,10 @@ jobs:
       checkout-fetch-depth: ${{ inputs.checkout-fetch-depth }}
       dockerfile: ${{ inputs.dockerfile }}
       build-context: ${{ inputs.build-context }}
+      distribute: ${{ inputs.distribute }}
+      arm64-runner: ${{ inputs.arm64-runner }}
+      amd64-runner: ${{ inputs.amd64-runner }}
+      compression: ${{ inputs.compression }}
     secrets:
       GH_CONTAINER_REGISTRY_USER: ${{ secrets.GH_CONTAINER_REGISTRY_USER }}
       GH_CONTAINER_REGISTRY_TOKEN: ${{ secrets.GH_CONTAINER_REGISTRY_TOKEN }}

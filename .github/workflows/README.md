@@ -77,6 +77,7 @@ line and remove the inputs below.
 | — | `pre-build-command` (new) |
 | — | `collect-logs` (new; was slaved to `run-log-check`, now independent and **defaults false**) |
 | — | `rollout-timeout` (new, default `10m`) |
+| — | `distribute`, `arm64-runner`, `amd64-runner`, `compression` (same names and defaults as 6.x) |
 | — | `build-cache` (new, default true) |
 
 Workflows deliberately **not** carried over: `test-unit`, `test-e2e`, `test-api`,
@@ -185,9 +186,29 @@ but they do consume that repository's 10GB Actions cache budget, and `cache-to` 
 `mode=max` (every intermediate layer, not just the final ones). Set `build-cache: false` to
 opt a repository out.
 
+Each platform job writes its own cache scope (`buildkit-linux-amd64`,
+`buildkit-linux-arm64-v8`), so the parallel jobs below never overwrite each other's cache.
+
 A cache only helps if the Dockerfile is layered so that expensive steps precede the
 frequently-changing `COPY`. A Dockerfile that copies the whole repository before installing
 dependencies re-installs them on every commit no matter what the cache does.
+
+## Platform builds
+
+With the default `distribute: true`, `build-push.yaml` builds each platform in its own job on
+a native runner -- `linux/arm64*` on `arm64-runner` (default `ubuntu-24.04-arm`), everything
+else on `amd64-runner` (default `ubuntu-latest`) -- pushes each by digest, and a
+`Merge Platform Images` job tags the combined manifest list. A single platform skips the merge
+and pushes its tags directly. `distribute: false` builds every platform in one job, emulating
+non-amd64 platforms under QEMU. At most four platforms can be distributed.
+
+`pre-build-command` runs once in **each** platform job, on that job's runner.
+
+Layers are pushed with `compression: zstd` by default (OCI media types), which needs
+containerd 1.5+ / Docker 23+ wherever the image is pulled. Set `compression: gzip` for older
+runtimes.
+
+The build job's check name includes its platform, e.g. `Build Image (linux/amd64)`.
 
 ## Single-image assumptions
 

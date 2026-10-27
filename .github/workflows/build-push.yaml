@@ -51,13 +51,34 @@ on:
         type: string
         default: '.'
 
+      distribute:
+        description: 'Build each platform in its own job on a native runner, then merge them into one multi-platform image. Set false to build every platform in a single job on amd64-runner (emulating non-amd64 platforms).'
+        required: false
+        type: boolean
+        default: true
+      arm64-runner:
+        description: 'Runner label for linux/arm64 builds when distribute is true. GitHub-hosted ubuntu-24.04-arm runners are available to public and private repositories. Set ubuntu-latest to emulate arm64 instead.'
+        required: false
+        type: string
+        default: ubuntu-24.04-arm
+      amd64-runner:
+        description: 'Runner label for linux/amd64 builds, and for any platform without a native runner mapping (built under emulation).'
+        required: false
+        type: string
+        default: ubuntu-latest
+      compression:
+        description: 'Layer compression for pushed images: "zstd" (default) or "gzip". zstd compresses and decompresses faster, but requires containerd 1.5+ / Docker 23+ wherever the image is pulled; use gzip for older runtimes.'
+        required: false
+        type: string
+        default: zstd
+
     outputs:
       image-tag:
         description: 'The immutable <short-sha>-<timestamp> tag that was pushed.'
-        value: ${{ jobs.build-image.outputs.image-tag }}
+        value: ${{ jobs.prepare.outputs.image-tag }}
       image-full-name:
         description: 'The full <image-name>:<tag> reference that was pushed.'
-        value: ${{ jobs.build-image.outputs.image-full-name }}
+        value: ${{ jobs.prepare.outputs.image-full-name }}
 
     secrets:
       GH_CONTAINER_REGISTRY_USER:
@@ -68,13 +89,155 @@ on:
         required: true
 
 jobs:
-  build-image:
-    name: Build Image
+  # Computes the tags once (so every platform job and the merge share one timestamp) and plans
+  # one build job per platform. Must not reference secrets: job outputs that may contain a
+  # secret value are silently dropped by the runner.
+  prepare:
+    name: Prepare Build
     runs-on: ubuntu-latest
     outputs:
+      tags: ${{ steps.fetch-push-tags.outputs.tags }}
       image-tag: ${{ steps.image-tag.outputs.image-tag }}
       image-full-name: ${{ steps.image-tag.outputs.image-full-name }}
+      build-date: ${{ steps.image-tag.outputs.build-date }}
+      matrix: ${{ steps.plan-platforms.outputs.matrix }}
+      multi: ${{ steps.plan-platforms.outputs.multi }}
+      count: ${{ steps.plan-platforms.outputs.count }}
     steps:
+      -
+        name: Resolve Image Tags
+        id: image-tag
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${GITHUB_SHA::7}"
+          TIMESTAMP="$(date -u +%Y%m%d%H%M%S)"
+          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          TAG="$SHORT_SHA-$TIMESTAMP"
+
+          # Sanitize the branch name into a valid Docker tag: replace any character outside
+          # [A-Za-z0-9_.-] with '-', strip leading '.'/'-', cap at 128 chars. Preserves case
+          # and dots so e.g. '11.x' stays '11.x' while 'feature/x' becomes 'feature-x'.
+          SAFE_REF="$(printf '%s' "$REF_NAME" | sed -E 's/[^A-Za-z0-9_.-]+/-/g; s/^[.-]+//' | cut -c1-128)"
+
+          {
+            echo "image-tag=$TAG"
+            echo "image-full-name=$IMAGE_NAME:$TAG"
+            echo "build-date=$BUILD_DATE"
+            echo "branch-tag=${SAFE_REF:+$IMAGE_NAME:$SAFE_REF}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Resolved image: $IMAGE_NAME:$TAG"
+        shell: bash
+      -
+        name: Determine Push Tags
+        id: fetch-push-tags
+        env:
+          HASH_NAME: ${{ steps.image-tag.outputs.image-full-name }}
+          BRANCH_NAME: ${{ steps.image-tag.outputs.branch-tag }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          # The unique hash-time image is always pushed.
+          tags="$HASH_NAME"
+
+          # Branch tag only on real branch pushes / manual dispatch (event allowlist; never
+          # PR or pull_request_target refs), and only when the sanitized branch name is non-empty.
+          if { [ "$EVENT_NAME" = "push" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; } \
+             && [ "$REF_TYPE" = "branch" ] && [ -n "$BRANCH_NAME" ]; then
+            tags="$HASH_NAME,$BRANCH_NAME"
+          fi
+
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "Resolved push tags: $tags"
+        shell: bash
+      -
+        name: Plan Platforms
+        id: plan-platforms
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+          DISTRIBUTE: ${{ inputs.distribute }}
+          ARM64_RUNNER: ${{ inputs.arm64-runner }}
+          AMD64_RUNNER: ${{ inputs.amd64-runner }}
+        run: |
+          set -euo pipefail
+          # One matrix entry per platform, on a native runner where one is mapped. linux/arm64
+          # gets the arm64 runner; everything else (including linux/arm/v7, which arm64 server
+          # CPUs often cannot execute natively) builds on the amd64 runner under emulation.
+          # With distribute=false, a single entry builds every platform in one job.
+          # The build job declares a fixed digest_0..digest_3 output per entry, hence the cap.
+          # cache-scope keeps each platform's BuildKit cache separate, so parallel jobs do not
+          # overwrite each other's cache.
+          max=4
+          matrix="$(jq -cn \
+            --arg platforms "$PLATFORMS" \
+            --argjson distribute "$DISTRIBUTE" \
+            --arg arm64 "$ARM64_RUNNER" \
+            --arg amd64 "$AMD64_RUNNER" '
+            [$platforms | split(",")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0)]
+            | reduce .[] as $p ([]; if any(.[]; . == $p) then . else . + [$p] end)
+            | if length == 0 then []
+              elif $distribute then
+                to_entries | map({
+                  platform: .value,
+                  runner: (if (.value | startswith("linux/arm64")) then $arm64 else $amd64 end),
+                  index: .key
+                })
+              else
+                [{platform: join(","), runner: $amd64, index: 0}]
+              end
+            | map(. + {"cache-scope": ("buildkit-" + (.platform | gsub("[^A-Za-z0-9_.-]+"; "-")))})
+            | {include: .}')"
+          count="$(jq '.include | length' <<<"$matrix")"
+          if [ "$count" -eq 0 ]; then
+            echo "::error title=No platforms::The platforms input '$PLATFORMS' contains no platforms."
+            exit 1
+          fi
+          if [ "$count" -gt "$max" ]; then
+            echo "::error title=Too many platforms::At most $max platforms can be distributed across runners; got $count. Reduce platforms or set distribute: false."
+            exit 1
+          fi
+          multi=false
+          [ "$count" -gt 1 ] && multi=true
+          {
+            echo "matrix=$matrix"
+            echo "count=$count"
+            echo "multi=$multi"
+          } >> "$GITHUB_OUTPUT"
+          jq -r '.include[] | "Planned \(.platform) on \(.runner)"' <<<"$matrix"
+        shell: bash
+
+  build-image:
+    name: Build Image (${{ matrix.platform }})
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    # Each matrix job sets only its own digest_<index>; GitHub combines matrix job outputs.
+    outputs:
+      digest_0: ${{ steps.export-digest.outputs.digest_0 }}
+      digest_1: ${{ steps.export-digest.outputs.digest_1 }}
+      digest_2: ${{ steps.export-digest.outputs.digest_2 }}
+      digest_3: ${{ steps.export-digest.outputs.digest_3 }}
+    steps:
+      -
+        name: Check Prepared Tags
+        env:
+          TAGS: ${{ needs.prepare.outputs.tags }}
+          IMAGE_TAG: ${{ needs.prepare.outputs.image-tag }}
+          IMAGE_FULL_NAME: ${{ needs.prepare.outputs.image-full-name }}
+        run: |
+          for name in TAGS IMAGE_TAG IMAGE_FULL_NAME; do
+            if [ -z "${!name}" ]; then
+              echo "::error title=Missing prepared value::$name from the Prepare Build job is empty. GitHub drops job outputs that may contain a secret value; check that job's log for 'Skip output'."
+              exit 1
+            fi
+          done
+        shell: bash
       - uses: actions/checkout@v7
         with:
           fetch-depth: ${{ inputs.checkout-fetch-depth }}
@@ -104,45 +267,9 @@ jobs:
           echo "Building '$resolved' with context '$context'"
         shell: bash
       -
-        name: Resolve Image Tags
-        id: image-tag
-        env:
-          IMAGE_NAME: ${{ inputs.image-name }}
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          SHORT_SHA="${GITHUB_SHA::7}"
-          TIMESTAMP="$(date -u +%Y%m%d%H%M%S)"
-          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          TAG="$SHORT_SHA-$TIMESTAMP"
-
-          # Sanitize the branch name into a valid Docker tag: replace any character outside
-          # [A-Za-z0-9_.-] with '-', strip leading '.'/'-', cap at 128 chars. Preserves case
-          # and dots so e.g. '11.x' stays '11.x' while 'feature/x' becomes 'feature-x'.
-          SAFE_REF="$(printf '%s' "$REF_NAME" | sed -E 's/[^A-Za-z0-9_.-]+/-/g; s/^[.-]+//' | cut -c1-128)"
-
-          {
-            echo "image-tag=$TAG"
-            echo "image-full-name=$IMAGE_NAME:$TAG"
-            echo "build-date=$BUILD_DATE"
-            echo "branch-tag=${SAFE_REF:+$IMAGE_NAME:$SAFE_REF}"
-          } >> "$GITHUB_OUTPUT"
-
-          # CONTRACT: this file's flat KEY=VALUE format and the build-image-tag artifact
-          # name below are consumed by repositories that call this workflow standalone.
-          # deploy.yaml in this repository reads the workflow outputs instead. See
-          # .github/workflows/README.md before changing either.
-          {
-            echo "BUILD_IMAGE_TAG=$TAG"
-            echo "BUILD_IMAGE_FULL_NAME=$IMAGE_NAME:$TAG"
-          } > /tmp/image_tag.env
-
-          echo "Resolved image: $IMAGE_NAME:$TAG"
-        shell: bash
-      -
         # The replacement for the old build-themes step. Deliberately reachable only through
         # workflow_call: this interpolates into a run: block, so it must never be settable
-        # from a workflow_dispatch form.
+        # from a workflow_dispatch form. Runs once per platform job, on that job's runner.
         name: Pre-build command
         if: inputs.pre-build-command != ''
         run: ${{ inputs.pre-build-command }}
@@ -151,6 +278,9 @@ jobs:
         name: Set up Docker Buildx
         id: buildx
         uses: docker/setup-buildx-action@v4
+        with:
+          # The runner is discarded after the job; removing the builder only delays the merge.
+          cleanup: false
       -
         name: Login to GitHub Container Registry
         uses: docker/login-action@v4
@@ -159,51 +289,145 @@ jobs:
           username: ${{ secrets.GH_CONTAINER_REGISTRY_USER }}
           password: ${{ secrets.GH_CONTAINER_REGISTRY_TOKEN }}
       -
-        name: Determine Push Tags
-        id: fetch-push-tags
+        name: Resolve Build Options
+        id: build-options
         env:
-          HASH_NAME: ${{ steps.image-tag.outputs.image-full-name }}
-          BRANCH_NAME: ${{ steps.image-tag.outputs.branch-tag }}
-          EVENT_NAME: ${{ github.event_name }}
-          REF_TYPE: ${{ github.ref_type }}
+          MULTI: ${{ needs.prepare.outputs.multi }}
+          IMAGE_NAME: ${{ inputs.image-name }}
+          COMPRESSION: ${{ inputs.compression }}
         run: |
           set -euo pipefail
-          # The unique hash-time image is always pushed.
-          tags="$HASH_NAME"
-
-          # Branch tag only on real branch pushes / manual dispatch (event allowlist; never
-          # PR or pull_request_target refs), and only when the sanitized branch name is non-empty.
-          if { [ "$EVENT_NAME" = "push" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; } \
-             && [ "$REF_TYPE" = "branch" ] && [ -n "$BRANCH_NAME" ]; then
-            tags="$HASH_NAME,$BRANCH_NAME"
+          # With several matrix jobs, each pushes its platform image untagged (by digest) and
+          # the merge job tags the combined image. With one, the tags are pushed directly.
+          if [ "$MULTI" = "true" ]; then
+            output="type=image,name=$IMAGE_NAME,push-by-digest=true,name-canonical=true,push=true"
+          else
+            output="type=image,push=true"
           fi
-
-          echo "tags=$tags" >> "$GITHUB_OUTPUT"
-          echo "Resolved push tags: $tags"
+          case "$COMPRESSION" in
+            gzip) ;;
+            zstd) output="$output,compression=zstd,oci-mediatypes=true" ;;
+            *) echo "::error title=Invalid compression::compression must be 'zstd' or 'gzip', got '$COMPRESSION'."; exit 1 ;;
+          esac
+          echo "output=$output" >> "$GITHUB_OUTPUT"
         shell: bash
       -
+        id: build
         env:
           DOCKER_BUILD_RECORD_RETENTION_DAYS: ${{ inputs.docker-build-record-retention-days }}
         uses: docker/build-push-action@v7
         with:
           provenance: false
           pull: true
-          push: true
-          platforms: ${{ inputs.platforms }}
+          platforms: ${{ matrix.platform }}
           # `context` must never be empty: build-push-action then falls back to the remote
           # git context, which silently discards workspace changes (e.g. anything the
           # pre-build command produced).
           context: ${{ inputs.build-context || '.' }}
           file: ${{ inputs.dockerfile }}
-          tags: ${{ steps.fetch-push-tags.outputs.tags }}
-          cache-from: ${{ inputs.build-cache && 'type=gha' || '' }}
-          cache-to: ${{ inputs.build-cache && 'type=gha,mode=max' || '' }}
+          tags: ${{ needs.prepare.outputs.multi != 'true' && needs.prepare.outputs.tags || '' }}
+          outputs: ${{ steps.build-options.outputs.output }}
+          cache-from: ${{ inputs.build-cache && format('type=gha,scope={0}', matrix.cache-scope) || '' }}
+          cache-to: ${{ inputs.build-cache && format('type=gha,mode=max,scope={0}', matrix.cache-scope) || '' }}
           build-args: |
-            BUILD_DATE=${{ steps.image-tag.outputs.build-date }}
+            BUILD_DATE=${{ needs.prepare.outputs.build-date }}
             VCS_REF=${{ github.ref_name }}
-            VERSION=${{ steps.image-tag.outputs.image-tag }}
+            VERSION=${{ needs.prepare.outputs.image-tag }}
       -
-        # CONTRACT: see the note in Resolve Image Tags above.
+        name: Export Digest
+        id: export-digest
+        if: needs.prepare.outputs.multi == 'true'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          INDEX: ${{ matrix.index }}
+        run: |
+          if [ -z "$DIGEST" ]; then
+            echo "::error title=Missing digest::The build did not report an image digest."
+            exit 1
+          fi
+          echo "digest_$INDEX=$DIGEST" >> "$GITHUB_OUTPUT"
+        shell: bash
+      -
+        name: Write Image Tag File
+        if: needs.prepare.outputs.multi != 'true'
+        env:
+          IMAGE_TAG: ${{ needs.prepare.outputs.image-tag }}
+          IMAGE_FULL_NAME: ${{ needs.prepare.outputs.image-full-name }}
+        run: |
+          echo "BUILD_IMAGE_TAG=$IMAGE_TAG" > /tmp/image_tag.env
+          echo "BUILD_IMAGE_FULL_NAME=$IMAGE_FULL_NAME" >> /tmp/image_tag.env
+        shell: bash
+      -
+        # CONTRACT: this artifact name and its flat KEY=VALUE format are consumed by
+        # repositories that call this workflow standalone. deploy.yaml in this repository
+        # reads the workflow outputs instead. See .github/workflows/README.md before changing
+        # either. Uploaded by whichever job pushes the tags: here for one platform, else
+        # merge-image.
+        if: needs.prepare.outputs.multi != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-image-tag
+          path: /tmp/image_tag.env
+
+  merge-image:
+    name: Merge Platform Images
+    needs: [ prepare, build-image ]
+    if: needs.prepare.outputs.multi == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      # No setup-buildx here: imagetools only talks to the registry, and the runner's
+      # preinstalled buildx plugin is enough for that.
+      -
+        name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.GH_CONTAINER_REGISTRY_USER }}
+          password: ${{ secrets.GH_CONTAINER_REGISTRY_TOKEN }}
+      -
+        name: Create Multi-Platform Image
+        env:
+          BUILD_OUTPUTS: ${{ toJSON(needs.build-image.outputs) }}
+          EXPECTED_COUNT: ${{ needs.prepare.outputs.count }}
+          IMAGE_NAME: ${{ inputs.image-name }}
+          TAGS: ${{ needs.prepare.outputs.tags }}
+          IMAGE_FULL_NAME: ${{ needs.prepare.outputs.image-full-name }}
+        run: |
+          set -euo pipefail
+          mapfile -t digests < <(jq -r 'to_entries[] | select(.key | startswith("digest_")) | .value | select(length > 0)' <<<"$BUILD_OUTPUTS")
+          if [ "${#digests[@]}" -ne "$EXPECTED_COUNT" ]; then
+            echo "::error title=Missing platform digests::Expected $EXPECTED_COUNT platform digests, got ${#digests[@]}. If only some build jobs were re-run, re-run all jobs instead."
+            exit 1
+          fi
+
+          args=()
+          IFS=, read -ra tag_list <<<"$TAGS"
+          for tag in "${tag_list[@]}"; do
+            args+=(--tag "$tag")
+          done
+          for digest in "${digests[@]}"; do
+            args+=("$IMAGE_NAME@$digest")
+          done
+          docker buildx imagetools create "${args[@]}"
+
+          manifest_count="$(docker buildx imagetools inspect --raw "$IMAGE_FULL_NAME" | jq '.manifests | length')"
+          if [ "$manifest_count" -ne "$EXPECTED_COUNT" ]; then
+            echo "::error title=Incomplete image::$IMAGE_FULL_NAME lists $manifest_count platform manifests; expected $EXPECTED_COUNT."
+            exit 1
+          fi
+          docker buildx imagetools inspect "$IMAGE_FULL_NAME"
+        shell: bash
+      -
+        name: Write Image Tag File
+        env:
+          IMAGE_TAG: ${{ needs.prepare.outputs.image-tag }}
+          IMAGE_FULL_NAME: ${{ needs.prepare.outputs.image-full-name }}
+        run: |
+          echo "BUILD_IMAGE_TAG=$IMAGE_TAG" > /tmp/image_tag.env
+          echo "BUILD_IMAGE_FULL_NAME=$IMAGE_FULL_NAME" >> /tmp/image_tag.env
+        shell: bash
+      -
+        # CONTRACT: see the build-image-tag upload in build-image.
         uses: actions/upload-artifact@v7
         with:
           name: build-image-tag
