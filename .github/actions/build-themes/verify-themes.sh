@@ -9,7 +9,10 @@
 # does not start with '_' compiles to dist/css/<name>.css (DrupalThemeCommands::buildThemeScss).
 # Like Symfony Finder, dot-files and dot-directories are skipped; dist/ is skipped too. Each
 # expected stylesheet must be non-empty and newer than the marker, which is touched before the
-# build, so a stale stylesheet committed to git cannot pass.
+# build, so a stale stylesheet committed to git cannot pass. It must also not be Dart Sass's
+# error stylesheet: when compiling to a file, Sass replaces the output of a failed compile with
+# one starting "/* Error: " that shows the error on every page (--error-css). Compressed
+# output never starts with a plain comment, so that prefix only appears on failure.
 #
 # On success, writes the repository-relative dist directories, one per line, to the output file.
 set -euo pipefail
@@ -42,6 +45,10 @@ while IFS= read -r -d '' info; do
         css="$theme/dist/css/$(basename "$scss" .scss).css"
         if [ ! -s "$css" ] || [ ! "$css" -nt "$marker" ]; then
             echo "::error file=${scss#"$root/"},title=Stylesheet not built::${css#"$root/"} was not built from ${scss#"$root/"}. The Sass error is in the Build Themes step log."
+            missing=$((missing + 1))
+        elif [ "$(head -c 10 "$css")" = "/* Error: " ]; then
+            echo "::error file=${scss#"$root/"},title=Stylesheet failed to compile::Sass could not compile ${scss#"$root/"}:"
+            sed -n '1,/\*\//p' "$css"
             missing=$((missing + 1))
         fi
     done < <(find "$theme" -mindepth 1 \( -name '.*' -o -path "$theme/dist" \) -prune \

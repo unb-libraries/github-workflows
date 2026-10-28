@@ -73,6 +73,13 @@ built front
 : > "$repo/custom/themes/front/dist/css/style.css"
 expect 1 "empty stylesheet"
 
+new_repo sasserror
+theme front src/scss/style.scss
+built front
+printf '/* Error: expected "}".\n *   src/scss/style.scss 1:2  root stylesheet */\n\nbody::before { content: "Error"; }\n' \
+    > "$repo/custom/themes/front/dist/css/style.css"
+expect 1 "Sass error stylesheet (--error-css) rejected" "Stylesheet failed to compile"
+
 new_repo stale
 theme front src/scss/style.scss
 built front style.css

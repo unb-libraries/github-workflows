@@ -220,10 +220,13 @@ identical CSS. The action:
    directory under `custom/themes` holding a `*info.yml` is a theme, and every `*.scss` in it
    whose name does not start with `_` must have produced a non-empty
    `dist/css/<name>.css` **during this build** (a stale stylesheet committed to git does not
-   count). dot-directories and `dist/` are not sources.
+   count) that is not Sass's error stylesheet. When a compile fails, Dart Sass writes a
+   stylesheet starting `/* Error: ` that displays the error at the top of every page, so a
+   size check alone passes it. dot-directories and `dist/` are not sources.
 
-The step fails, naming each missing stylesheet, if any stylesheet was not built -- dockworker
-itself ignores Sass failures -- and also if there is nothing to build at all, which means the
+The step fails, naming each stylesheet and showing the Sass error, if any stylesheet was not
+built -- dockworker itself ignores Sass failures, so on 6.x a broken stylesheet deployed that
+error banner with a green build -- and also if there is nothing to build at all, which means the
 caller should not set `build-themes: true`. The theme build logic stays in dockworker; this
 repository only provisions and checks it.
 
