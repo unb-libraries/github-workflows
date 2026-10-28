@@ -299,15 +299,29 @@ at the build step; do not remove that guard.
 
 ## Build cache
 
-`build-push.yaml` reads and writes a BuildKit layer cache (`type=gha`) by default. The
-Actions cache is scoped to the **calling** repository, so caches never mix between repos --
-but they do consume that repository's 10GB Actions cache budget, and `cache-to` uses
-`mode=max` (every intermediate layer, not just the final ones). Set `build-cache: false` to
-opt a repository out.
+`build-push.yaml` reads and writes a BuildKit layer cache in the registry by default, as
+`<image-name>:buildcache-<platform>` (for example `…/hit.lib.unb.ca:buildcache-linux-amd64`).
+`cache-to` uses `mode=max`, so the intermediate stages of a multi-stage build are cached
+too. Pushes and manual runs write the cache; pull requests only read it. The cache's final
+layers are byte-identical to the image's, so the registry stores them once (on hit, the
+cache tag is the same 23 layers / 186 MB as the image). `container-image-pruner` never
+deletes text tags, so the cache tags persist. Set `build-cache: false` to opt out.
 
-Each image and platform has its own cache scope (`<image-name>-<platform>`, sanitized), so
-parallel platform jobs, and two images built from one repository, never overwrite each
-other's cache.
+Measured on hit.lib.unb.ca (single-stage Drupal image, 13 s `RUN build.sh`), image-build
+step in seconds, amd64 / arm64:
+
+| Backend | Cold | Warm, no change | `build/` changed |
+|---|---|---|---|
+| `type=gha` (the previous default) | 38 / 21 | 32 / 26 | 24 / 24 |
+| registry (now the default) | 28 / 26 | 20 / 19 | 23 / 20 |
+| none | 22 / 21 | 24 / 24 | 20 / 18 |
+
+The Actions cache was slower than no cache in every case: a hit downloaded ~100 MB from the
+Actions cache to skip a 13 s step, and every run paid ~9 s to export to it, out of the
+repository's 10 GB Actions budget. The registry cache is within noise of no cache on an image
+this cheap to build. It is the default because it costs nothing measurable there and pays
+off where the cached step is expensive -- `RUN build.sh` takes 35-67 s on larger Drupal
+sites, and Nuxt builds cache their install stage. No multi-stage image was measured.
 
 A cache only helps if the Dockerfile is layered so that expensive steps precede the
 frequently-changing `COPY`. A Dockerfile that copies the whole repository before installing

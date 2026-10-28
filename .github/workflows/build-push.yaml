@@ -43,19 +43,13 @@ on:
         default: linux/amd64,linux/arm64/v8
       build-cache:
         description: >-
-          Read and write a BuildKit layer cache in the GitHub Actions cache. Default true.
-          The cache is scoped to the CALLING repository, so it never mixes across repos, but
-          it does consume that repository's 10GB Actions cache budget. Set false for a
-          repository whose other caches matter more, or whose image gains nothing from
-          layer reuse.
+          Read and write a BuildKit layer cache, stored in the registry as
+          <image-name>:buildcache-<platform>. Pushes and manual runs write it; pull requests
+          only read it. Its final layers are the image's own, so it adds little storage.
+          Default true.
         required: false
         type: boolean
         default: true
-      cache-backend:
-        description: 'TEMPORARY (harden branch A/B only): gha, registry or none.'
-        required: false
-        type: string
-        default: gha
       docker-build-record-retention-days:
         description: 'Number of days to retain Docker build records.'
         required: false
@@ -192,7 +186,6 @@ jobs:
         name: Plan Platforms
         id: plan-platforms
         env:
-          IMAGE_NAME: ${{ inputs.image-name }}
           PLATFORMS: ${{ inputs.platforms }}
           DISTRIBUTE: ${{ inputs.distribute }}
           ARM64_RUNNER: ${{ inputs.arm64-runner }}
@@ -204,11 +197,8 @@ jobs:
           # CPUs often cannot execute natively) builds on the amd64 runner under emulation.
           # With distribute=false, a single entry builds every platform in one job.
           # The build job declares a fixed digest_0..digest_3 output per entry, hence the cap.
-          # cache-scope keeps each image's and platform's BuildKit cache separate, so parallel
-          # jobs, and two images built from one repository, never overwrite each other's cache.
           max=4
           matrix="$(jq -cn \
-            --arg image "$IMAGE_NAME" \
             --arg platforms "$PLATFORMS" \
             --argjson distribute "$DISTRIBUTE" \
             --arg arm64 "$ARM64_RUNNER" \
@@ -225,7 +215,6 @@ jobs:
               else
                 [{platform: join(","), runner: $amd64, index: 0}]
               end
-            | map(. + {"cache-scope": (($image + "-" + .platform) | gsub("[^A-Za-z0-9_.-]+"; "-"))})
             | {include: .}')"
           count="$(jq '.include | length' <<<"$matrix")"
           if [ "$count" -eq 0 ]; then
@@ -438,8 +427,6 @@ jobs:
           IMAGE_NAME: ${{ inputs.image-name }}
           COMPRESSION: ${{ inputs.compression }}
           BUILD_CACHE: ${{ inputs.build-cache }}
-          CACHE_BACKEND: ${{ inputs.cache-backend }}
-          CACHE_SCOPE: ${{ matrix.cache-scope }}
           PLATFORM: ${{ matrix.platform }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
@@ -457,23 +444,18 @@ jobs:
             *) echo "::error title=Invalid compression::compression must be 'zstd' or 'gzip', got '$COMPRESSION'."; exit 1 ;;
           esac
 
+          # A registry cache per image and platform. With matching compression its final layers
+          # are the image's own blobs, so the export dedupes against the push. Pull requests
+          # read it but never write it. (Measured on hit.lib.unb.ca, the type=gha cache was
+          # slower than no cache in every scenario: see README, Build cache.)
           cache_from=""
           cache_to=""
           if [ "$BUILD_CACHE" = "true" ]; then
-            case "$CACHE_BACKEND" in
-              gha)
-                cache_from="type=gha,scope=$CACHE_SCOPE"
-                cache_to="type=gha,mode=max,scope=$CACHE_SCOPE" ;;
-              registry)
-                ref="$IMAGE_NAME:buildcache-$(printf '%s' "$PLATFORM" | sed -E 's/[^A-Za-z0-9_.-]+/-/g')"
-                cache_from="type=registry,ref=$ref"
-                # Pull requests read the cache but never write it.
-                if [ "$EVENT_NAME" = "push" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-                  cache_to="type=registry,ref=$ref,mode=max,image-manifest=true,oci-mediatypes=true,compression=$COMPRESSION"
-                fi ;;
-              none) ;;
-              *) echo "::error title=Invalid cache-backend::'$CACHE_BACKEND'"; exit 1 ;;
-            esac
+            ref="$IMAGE_NAME:buildcache-$(printf '%s' "$PLATFORM" | sed -E 's/[^A-Za-z0-9_.-]+/-/g')"
+            cache_from="type=registry,ref=$ref"
+            if [ "$EVENT_NAME" = "push" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+              cache_to="type=registry,ref=$ref,mode=max,image-manifest=true,oci-mediatypes=true,compression=$COMPRESSION"
+            fi
           fi
           {
             echo "output=$output"
