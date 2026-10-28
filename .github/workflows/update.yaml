@@ -1,0 +1,270 @@
+name: Update Application and Dependencies
+
+on:
+  workflow_call:
+    inputs:
+      composer-image:
+        description: >-
+          Image to run the update in. Default empty: the image named by the first FROM in
+          `dockerfile`, i.e. the application's own base image, so dependencies resolve
+          against the PHP version the application runs.
+        required: false
+        type: string
+        default: ''
+      dockerfile:
+        description: 'Dockerfile whose first FROM names the update image when composer-image is empty. Default Dockerfile.'
+        required: false
+        type: string
+        default: 'Dockerfile'
+      add-paths:
+        description: >-
+          Optional override for the paths staged in the pull request (git pathspecs, one per
+          line). Default empty: derived from the update targets.
+        required: false
+        type: string
+        default: ''
+      pr-branch:
+        description: 'Branch the pull request is opened from. Default application-updates.'
+        required: false
+        type: string
+        default: 'application-updates'
+      git-author:
+        description: 'Author identity ("Name <email>") for the update PR commit.'
+        required: false
+        type: string
+        default: 'UNB Libraries CodeBot <libsystems@unb.ca>'
+      git-committer:
+        description: 'Committer identity ("Name <email>") for the update PR commit.'
+        required: false
+        type: string
+        default: 'UNB Libraries CodeBot <libsystems@unb.ca>'
+    secrets:
+      PAT_TOKEN:
+        description: 'The token to use for creating the pull request'
+        required: true
+
+jobs:
+  update-application:
+    name: Update Application and Dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      -
+        # Targets come from .dockworker/dockworker.yml, the same configuration the local
+        # `dockworker update` command reads:
+        #
+        #   dockworker:
+        #     update:
+        #       targets:
+        #         - dir: build
+        #           type: composer
+        #
+        # Inline command, lockfile, manifest and commit_paths keys override the type's preset.
+        name: Resolve Update Targets
+        id: targets
+        run: |
+          set -euo pipefail
+          config=.dockworker/dockworker.yml
+          if [ ! -f "$config" ]; then
+            echo "::error title=No update configuration::$config does not exist."
+            exit 1
+          fi
+          raw=$(yq -o=json '.dockworker.update.targets // []' "$config")
+          # Composer resolves against the image's PHP version, strictly; extension requirements
+          # are ignored because the application's own Dockerfile installs its extensions.
+          targets=$(jq -c '
+            def preset: {
+              composer: {
+                command: ["composer", "update", "--no-install", "--no-scripts", "--no-plugins",
+                          "--no-interaction", "--ignore-platform-req=ext-*"],
+                lockfile: "composer.lock",
+                manifest: "composer.json",
+                commit_paths: ["composer.json", "composer.lock"]
+              }
+            };
+            [ .[] | . as $t
+              | (preset[$t.type // ""] // {}) as $p
+              | {
+                  dir: (($t.dir // "") | tostring | rtrimstr("/")),
+                  type: ($t.type // ""),
+                  command: ($t.command // $p.command),
+                  lockfile: ($t.lockfile // $p.lockfile),
+                  manifest: ($t.manifest // $p.manifest // ""),
+                  commit_paths: ($t.commit_paths // $p.commit_paths // [($t.lockfile // $p.lockfile)])
+                } ]' <<<"$raw")
+          count=$(jq length <<<"$targets")
+          if [ "$count" -eq 0 ]; then
+            echo "::error title=No update targets::$config has no dockworker.update.targets."
+            exit 1
+          fi
+          problems=$(jq -r '.[] |
+            if .dir == "" then "a target has no dir"
+            elif (.dir | startswith("/")) or (.dir | split("/") | index("..")) then "dir \(.dir) must be relative, inside the repository"
+            elif (.command | type) != "array" or (.command | length) == 0 then "dir \(.dir): unknown type \(.type | tojson) and no command"
+            elif (.lockfile | type) != "string" or .lockfile == "" then "dir \(.dir): no lockfile"
+            else empty end' <<<"$targets")
+          if [ -n "$problems" ]; then
+            while IFS= read -r problem; do
+              echo "::error title=Invalid update target::$problem"
+            done <<<"$problems"
+            exit 1
+          fi
+          jq -r '.[] | "Target \(.dir): \(.command | join(" "))"' <<<"$targets"
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+        shell: bash
+      -
+        name: Resolve Update Image
+        id: image
+        env:
+          COMPOSER_IMAGE: ${{ inputs.composer-image }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: |
+          set -euo pipefail
+          image="$COMPOSER_IMAGE"
+          if [ -z "$image" ]; then
+            if [ ! -f "$DOCKERFILE" ]; then
+              echo "::error title=No Dockerfile::$DOCKERFILE does not exist; set composer-image."
+              exit 1
+            fi
+            # The first FROM's image, skipping flags such as --platform.
+            image=$(awk 'toupper($1) == "FROM" { for (i = 2; i <= NF; i++) if ($i !~ /^--/) { print $i; exit } }' "$DOCKERFILE")
+          fi
+          case "$image" in
+            '' | *'$'*)
+              echo "::error title=No update image::Could not take a plain image name from the first FROM in $DOCKERFILE ('$image'); set composer-image."
+              exit 1 ;;
+          esac
+          docker pull --quiet "$image" >/dev/null
+          php=$(docker run --rm --entrypoint php "$image" -r 'echo PHP_VERSION;')
+          echo "Updating in $image (PHP $php)"
+          {
+            echo "image=$image"
+            echo "php=$php"
+          } >> "$GITHUB_OUTPUT"
+        shell: bash
+      -
+        name: Update Application and Dependencies
+        id: update
+        env:
+          TARGETS: ${{ steps.targets.outputs.targets }}
+          IMAGE: ${{ steps.image.outputs.image }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          # Authenticated GitHub downloads avoid the anonymous API rate limit.
+          COMPOSER_AUTH=$(jq -cn --arg token "$GITHUB_TOKEN" '{"github-oauth": {"github.com": $token}}')
+          export COMPOSER_AUTH
+          failures=()
+          add_paths=()
+          primary_lock=""
+          while IFS= read -r target; do
+            dir=$(jq -r .dir <<<"$target")
+            mapfile -t command < <(jq -r '.command[]' <<<"$target")
+            lockfile=$(jq -r .lockfile <<<"$target")
+            manifest=$(jq -r .manifest <<<"$target")
+            echo "::group::Updating $dir"
+            if [ ! -d "$dir" ] || { [ -n "$manifest" ] && [ ! -f "$dir/$manifest" ]; }; then
+              echo "::error title=Missing update target::$dir${manifest:+/$manifest} does not exist."
+              failures+=("$dir (missing)")
+              echo "::endgroup::"
+              continue
+            fi
+            # Run as the runner's user so the updated files stay writable for the commit.
+            if docker run --rm --user "$(id -u):$(id -g)" \
+                -e HOME=/tmp -e COMPOSER_HOME=/tmp/composer -e COMPOSER_AUTH \
+                -v "$GITHUB_WORKSPACE:/work" -w "/work/$dir" \
+                --entrypoint "${command[0]}" "$IMAGE" "${command[@]:1}"; then
+              while IFS= read -r path; do add_paths+=("$dir/$path"); done < <(jq -r '.commit_paths[]' <<<"$target")
+              if [ -z "$primary_lock" ] && [ "$(jq -r .type <<<"$target")" = "composer" ]; then
+                primary_lock="$dir/$lockfile"
+              fi
+              if git diff --quiet -- "$dir/$lockfile"; then
+                echo "No updates: $dir/$lockfile unchanged."
+              else
+                echo "Updates found: $dir/$lockfile changed."
+              fi
+            else
+              echo "::error title=Update failed::${command[*]} failed in $dir."
+              failures+=("$dir")
+            fi
+            echo "::endgroup::"
+          done < <(jq -c '.[]' <<<"$TARGETS")
+
+          if [ "${#failures[@]}" -gt 0 ]; then
+            echo "::error title=Update failed::Dependency update failed for: ${failures[*]}"
+            exit 1
+          fi
+          {
+            echo "add-paths<<ADD_PATHS_EOF"
+            printf '%s\n' "${add_paths[@]}" | awk '!seen[$0]++'
+            echo "ADD_PATHS_EOF"
+            echo "primary-lock=$primary_lock"
+          } >> "$GITHUB_OUTPUT"
+        shell: bash
+      -
+        name: Describe Changes
+        env:
+          TARGETS: ${{ steps.targets.outputs.targets }}
+          IMAGE: ${{ steps.image.outputs.image }}
+          PHP_VERSION: ${{ steps.image.outputs.php }}
+        run: |
+          set -euo pipefail
+          body="$RUNNER_TEMP/body.md"
+          # shellcheck disable=SC2016 # Markdown backticks, not command substitution.
+          printf 'Auto-generated by [github-workflows][1] in `%s` (PHP %s).\n' "$IMAGE" "$PHP_VERSION" > "$body"
+          # One section per composer target: direct dependencies that changed, then a count of
+          # changed transitive packages.
+          while IFS= read -r target; do
+            [ "$(jq -r .type <<<"$target")" = "composer" ] || continue
+            dir=$(jq -r .dir <<<"$target")
+            lock="$dir/$(jq -r .lockfile <<<"$target")"
+            manifest="$dir/$(jq -r .manifest <<<"$target")"
+            git diff --quiet -- "$lock" && continue
+            # Through a file: a lock file can exceed the 128 KB limit on a single argument.
+            git show "HEAD:$lock" > "$RUNNER_TEMP/old.lock" 2>/dev/null || echo '{}' > "$RUNNER_TEMP/old.lock"
+            {
+              printf '\n### %s\n\n' "$lock"
+              jq -rn \
+                --slurpfile oldlock "$RUNNER_TEMP/old.lock" \
+                --slurpfile new "$lock" \
+                --slurpfile manifest "$manifest" '
+                # A branch alias (dev-*) keeps its version as its commit moves, so show the commit.
+                def versions(lock): ((lock.packages // []) + (lock["packages-dev"] // []))
+                  | map({key: .name, value: (if (.version | startswith("dev-"))
+                      then "\(.version) \((.source.reference // .dist.reference // "")[0:7])"
+                      else .version end)}) | from_entries;
+                versions($oldlock[0]) as $o | versions($new[0]) as $n
+                | ($manifest[0] | ((.require // {}) + (."require-dev" // {})) | keys) as $direct
+                | [($o + $n) | keys[] | select($o[.] != $n[.])] as $changed
+                | [$changed[] | select(. as $p | $direct | index($p))] as $rows
+                | (if ($rows | length) > 0
+                    then "| Package | From | To |\n|---|---|---|\n"
+                      + ($rows | map("| \(.) | \($o[.] // "-") | \($n[.] // "-") |") | join("\n"))
+                    else "No direct dependency changes." end)
+                  + "\n\nTransitive packages changed: \(($changed | length) - ($rows | length))"'
+            } >> "$body"
+          done < <(jq -c '.[]' <<<"$TARGETS")
+          printf '\n[1]: https://github.com/unb-libraries/github-workflows/blob/1.x/.github/workflows/update.yaml\n' >> "$body"
+          cat "$body"
+        shell: bash
+      -
+        name: Create Pull Request
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+          commit-message: Update Application and Dependencies
+          committer: ${{ inputs.git-committer }}
+          author: ${{ inputs.git-author }}
+          signoff: false
+          branch: ${{ inputs.pr-branch }}
+          add-paths: ${{ inputs.add-paths != '' && inputs.add-paths || steps.update.outputs.add-paths }}
+          delete-branch: true
+          title: 'Application Updates'
+          body-path: ${{ runner.temp }}/body.md
+          labels: |
+            automated
+            updates
+          draft: false

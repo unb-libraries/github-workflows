@@ -19,6 +19,9 @@ runs the application's own dockworker.
 | `publish-image.yaml` | Build/push, with Slack start + conclusion notifications, and no deploy. For base and service images that other repositories consume. |
 | `build-push-notify.yaml` | **Deprecated** (remove in 2.x): wraps `publish-image.yaml` unchanged. Repoint `uses:` to `publish-image.yaml`; inputs and secrets are identical. |
 | `build-push-deploy-notify.yaml` | Build/push, deploy to Kubernetes, prune, notify. The common case. |
+| `update.yaml` | Scheduled composer updates, opened as a pull request. See [Updaters](#updaters). |
+| `update-nuxt.yaml` | Scheduled pnpm updates for Nuxt applications, opened as a pull request. |
+| `update-ckeditor5.yaml` | Scheduled updates of a Drupal site's CKEditor 5 plugin modules, opened as a pull request. |
 
 Supporting workflows (`deploy.yaml`, `notify-start.yaml`, `notify-conclusion.yaml`) are
 called by the orchestrators and are not usually invoked directly.
@@ -106,12 +109,73 @@ on one of them.
 - **Every job has a timeout.**
 
 Workflows deliberately **not** carried over: `test-unit`, `test-e2e`, `test-api`,
-`test-logs` (replaced by the `check-logs` action), `update`, `update-docker-compose`, `install-test`, `workflow-os`,
+`test-logs` (replaced by the `check-logs` action), `update-docker-compose`, `install-test`, `workflow-os`,
 `trim-registry-images` (deprecated in favour of `unb-libraries/container-image-pruner`),
 and `build-push-test-deploy-notify` (zero consumers, and its `needs:` chain is broken --
 `build-push-images` hard-depends on a job that skips whenever `test` omits `unit`).
-`update.yaml` remains in dockworker: it is a `vendor/bin/dockworker update` wrapper and
-belongs to that package's local-development surface.
+
+## Updaters
+
+The three updaters are called from a scheduled workflow in each application and open (or
+refresh) one pull request with the changes; nothing is pushed to a deploy branch directly.
+Each takes `pr-branch` (the pull request's branch), `git-author` and `git-committer`, and the
+`PAT_TOKEN` secret, as in dockworker 6.x.
+
+```yaml
+on:
+  schedule:
+    - cron: '44 6 * * 1,4'
+  workflow_dispatch:
+
+jobs:
+  update:
+    uses: unb-libraries/github-workflows/.github/workflows/update.yaml@1.x
+    secrets:
+      PAT_TOKEN: ${{ secrets.UNBLIBBOT_PAT_TOKEN }}
+```
+
+### `update.yaml`
+
+Updates the composer dependencies of each target in `.dockworker/dockworker.yml`, the same
+configuration the local `dockworker update` command reads:
+
+```yaml
+dockworker:
+  update:
+    targets:
+      - dir: build
+        type: composer
+```
+
+The update runs **inside the application's own base image** -- by default the image named by
+the first `FROM` in `Dockerfile`; set `composer-image` (or `dockerfile`) to override -- so
+dependencies resolve against the PHP version the application actually runs, using the
+Composer that image ships. The `composer` type runs
+`composer update --no-install --no-scripts --no-plugins --ignore-platform-req=ext-*`: the PHP
+version is checked strictly, extension requirements are not (the application's Dockerfile
+installs its extensions). Inline `command`, `lockfile`, `manifest` and `commit_paths` keys on a
+target override the type's preset, and also run in that image.
+
+The pull request stages each target's `composer.json` and `composer.lock` (or its
+`commit_paths`; `add-paths` overrides all of them). Its description names the image and PHP
+version, lists changed direct dependencies (a `dev-*` branch shows its commit), and counts the
+changed transitive packages.
+
+Differences from dockworker 6.x:
+
+- No PHP, Composer or dockworker is installed on the runner, and `docker compose pull` is gone.
+  `php-version` and `composer-version` are **removed**; remove them from callers.
+- 6.x always resolved with PHP 8.4 (or the caller's `php-version`), whatever the application
+  ran. A PHP 8.2 site therefore failed every update (lib.unb.ca, since at least 2026-10-08),
+  or worse, could be offered packages its runtime cannot load.
+- `add-paths` is optional; the derived paths are the same as 6.x's.
+
+### `update-nuxt.yaml` and `update-ckeditor5.yaml`
+
+Ported unchanged from dockworker 6.x apart from the `pr-branch` input, a timeout and the link
+in the pull request description. `update-nuxt.yaml` runs `pnpm update` (`latest: true` for
+`--latest`); `update-ckeditor5.yaml` pins each module's `ckeditor5` to the range the site's
+Drupal core ships and rebuilds the plugins.
 
 ## Deployment log check
 
