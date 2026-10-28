@@ -242,7 +242,7 @@ jobs:
         name: Build Themes
         id: build-themes
         if: inputs.build-themes
-        uses: unb-libraries/github-workflows/.github/actions/build-themes@harden
+        uses: unb-libraries/github-workflows/.github/actions/build-themes@1.x
         with:
           php-version: ${{ inputs.php-version }}
       -

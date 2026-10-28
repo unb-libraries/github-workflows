@@ -89,12 +89,12 @@ jobs:
   notify-start:
     name: Notify of Start
     if: always()
-    uses: unb-libraries/github-workflows/.github/workflows/notify-start.yaml@harden
+    uses: unb-libraries/github-workflows/.github/workflows/notify-start.yaml@1.x
     secrets:
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
   build-push-images:
-    uses: unb-libraries/github-workflows/.github/workflows/build-push.yaml@harden
+    uses: unb-libraries/github-workflows/.github/workflows/build-push.yaml@1.x
     needs: [ notify-start ]
     with:
       image-name: ${{ inputs.image-name }}
@@ -117,7 +117,7 @@ jobs:
 
   notify-conclusion:
     name: Notify of Conclusion
-    uses: unb-libraries/github-workflows/.github/workflows/notify-conclusion.yaml@harden
+    uses: unb-libraries/github-workflows/.github/workflows/notify-conclusion.yaml@1.x
     needs: [ build-push-images ]
     if: always()
     with:

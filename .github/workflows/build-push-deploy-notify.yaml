@@ -146,13 +146,13 @@ jobs:
   notify-start:
     name: Notify Start
     if: always()
-    uses: unb-libraries/github-workflows/.github/workflows/notify-start.yaml@harden
+    uses: unb-libraries/github-workflows/.github/workflows/notify-start.yaml@1.x
     secrets:
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
   build-push-images:
     name: Build/Push Images
-    uses: unb-libraries/github-workflows/.github/workflows/build-push.yaml@harden
+    uses: unb-libraries/github-workflows/.github/workflows/build-push.yaml@1.x
     with:
       image-name: ${{ inputs.image-name }}
       build-themes: ${{ inputs.build-themes }}
@@ -176,7 +176,7 @@ jobs:
 
   deploy-image-to-k8s:
     name: Deploy New Image
-    uses: unb-libraries/github-workflows/.github/workflows/deploy.yaml@harden
+    uses: unb-libraries/github-workflows/.github/workflows/deploy.yaml@1.x
     needs: [ build-push-images ]
     with:
       branch-env-map: ${{ inputs.branch-env-map }}
@@ -218,7 +218,7 @@ jobs:
         name: Check Logs for Errors
         # A failed deploy is already red; scanning its logs would only add a second failure.
         if: ${{ needs.deploy-image-to-k8s.result == 'success' && steps.download.outcome == 'success' }}
-        uses: unb-libraries/github-workflows/.github/actions/check-logs@harden
+        uses: unb-libraries/github-workflows/.github/actions/check-logs@1.x
         with:
           log-file: /tmp/logs/deployment_logs.txt
           profile: ${{ inputs.log-check-profile }}
@@ -251,7 +251,7 @@ jobs:
 
   notify-conclusion:
     name: Notify Conclusion
-    uses: unb-libraries/github-workflows/.github/workflows/notify-conclusion.yaml@harden
+    uses: unb-libraries/github-workflows/.github/workflows/notify-conclusion.yaml@1.x
     # Waits for every job that decides the outcome. Prune Old Images is best-effort
     # (continue-on-error) and deliberately excluded.
     needs: [ build-push-images, deploy-image-to-k8s, check-deployment-logs ]

@@ -89,7 +89,7 @@ on:
 
 jobs:
   publish:
-    uses: unb-libraries/github-workflows/.github/workflows/publish-image.yaml@harden
+    uses: unb-libraries/github-workflows/.github/workflows/publish-image.yaml@1.x
     with:
       image-name: ${{ inputs.image-name }}
       pre-build-command: ${{ inputs.pre-build-command }}
