@@ -44,9 +44,10 @@ on:
       build-cache:
         description: >-
           Read and write a BuildKit layer cache, stored in the registry as
-          <image-name>:buildcache-<platform>. Pushes and manual runs write it; pull requests
-          only read it. Its final layers are the image's own, so it adds little storage.
-          Default true.
+          <image-name>:buildcache-<branch>-<platform>. Each branch reads its own cache, then
+          the default branch's; pushes and manual runs write their branch's; pull requests only
+          read their base branch's. Its final layers are the image's own, so it adds little
+          storage. Default true.
         required: false
         type: boolean
         default: true
@@ -429,6 +430,9 @@ jobs:
           BUILD_CACHE: ${{ inputs.build-cache }}
           PLATFORM: ${{ matrix.platform }}
           EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          BASE_REF: ${{ github.base_ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           # With several matrix jobs, each pushes its platform image untagged (by digest) and
@@ -444,22 +448,43 @@ jobs:
             *) echo "::error title=Invalid compression::compression must be 'zstd' or 'gzip', got '$COMPRESSION'."; exit 1 ;;
           esac
 
-          # A registry cache per image and platform. With matching compression its final layers
-          # are the image's own blobs, so the export dedupes against the push. Pull requests
-          # read it but never write it. (Measured on hit.lib.unb.ca, the type=gha cache was
-          # slower than no cache in every scenario: see README, Build cache.)
+          # A registry cache per image, branch and platform. With matching compression its final
+          # layers are the image's own blobs, so the export dedupes against the push. Each branch
+          # reads its own cache, then the default branch's, so a new branch (or prod) starts from
+          # dev's layers; branches never overwrite each other's cache. Pull requests read their
+          # base branch's cache and never write. (Measured on hit.lib.unb.ca, the type=gha cache
+          # was slower than no cache in every scenario: see README, Build cache.)
+          cache_ref() {
+            # A valid tag: sanitized like the branch tag, at most 128 characters.
+            local tag
+            tag="buildcache-$(printf '%s-%s' "$1" "$PLATFORM" | sed -E 's/[^A-Za-z0-9_.-]+/-/g')"
+            printf '%s:%s' "$IMAGE_NAME" "${tag:0:128}"
+          }
           cache_from=""
           cache_to=""
           if [ "$BUILD_CACHE" = "true" ]; then
-            ref="$IMAGE_NAME:buildcache-$(printf '%s' "$PLATFORM" | sed -E 's/[^A-Za-z0-9_.-]+/-/g')"
-            cache_from="type=registry,ref=$ref"
-            if [ "$EVENT_NAME" = "push" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-              cache_to="type=registry,ref=$ref,mode=max,image-manifest=true,oci-mediatypes=true,compression=$COMPRESSION"
+            case "$EVENT_NAME" in
+              pull_request|pull_request_target) branch="$BASE_REF"; writes=false ;;
+              *) branch="$REF_NAME"; writes=true ;;
+            esac
+            if [ -n "$branch" ]; then
+              cache_from="type=registry,ref=$(cache_ref "$branch")"
+              if [ "$writes" = "true" ]; then
+                cache_to="type=registry,ref=$(cache_ref "$branch"),mode=max,image-manifest=true,oci-mediatypes=true,compression=$COMPRESSION"
+              fi
             fi
+            if [ -n "$DEFAULT_BRANCH" ] && [ "$DEFAULT_BRANCH" != "$branch" ]; then
+              cache_from="${cache_from:+$cache_from$'\n'}type=registry,ref=$(cache_ref "$DEFAULT_BRANCH")"
+            fi
+            echo "Cache sources:"
+            while IFS= read -r source; do echo "  $source"; done <<<"${cache_from:-none}"
+            echo "Cache destination: ${cache_to:-none}"
           fi
           {
             echo "output=$output"
-            echo "cache-from=$cache_from"
+            echo "cache-from<<CACHE_FROM_EOF"
+            printf '%s\n' "$cache_from"
+            echo "CACHE_FROM_EOF"
             echo "cache-to=$cache_to"
           } >> "$GITHUB_OUTPUT"
         shell: bash

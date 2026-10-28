@@ -300,9 +300,19 @@ at the build step; do not remove that guard.
 ## Build cache
 
 `build-push.yaml` reads and writes a BuildKit layer cache in the registry by default, as
-`<image-name>:buildcache-<platform>` (for example `…/hit.lib.unb.ca:buildcache-linux-amd64`).
-`cache-to` uses `mode=max`, so the intermediate stages of a multi-stage build are cached
-too. Pushes and manual runs write the cache; pull requests only read it. The cache's final
+`<image-name>:buildcache-<branch>-<platform>` (for example
+`…/lib.unb.ca:buildcache-dev-linux-amd64`). `cache-to` uses `mode=max`, so the intermediate
+stages of a multi-stage build are cached too.
+
+- A push or manual run reads its branch's cache, then the **default branch's**, and writes
+  only its own branch's. So `prod`, or a long-lived feature branch whose `build/` differs
+  from `dev`'s, never overwrites `dev`'s cache, and a new branch starts from `dev`'s layers.
+- A pull request reads its base branch's cache, then the default branch's, and never writes.
+- Tag names are sanitized like the branch tag and capped at 128 characters.
+
+A caller that builds every branch on push (rather than the recommended `[dev, prod]`) leaves
+one cache tag per feature branch and platform; `container-image-pruner` never deletes text
+tags, so remove those with the branch. The cache's final
 layers are byte-identical to the image's, so the registry stores them once (on hit, the
 cache tag is the same 23 layers / 186 MB as the image). `container-image-pruner` never
 deletes text tags, so the cache tags persist. Set `build-cache: false` to opt out.
