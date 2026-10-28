@@ -3,6 +3,13 @@ name: Build Image and Push To Registry
 on:
   workflow_call:
     inputs:
+      build-themes:
+        description: >-
+          Build the Drupal theme assets with the application's own dockworker theme:build-all
+          before the image build. Runs before pre-build-command. Default false.
+        required: false
+        type: boolean
+        default: false
       image-name:
         description: 'The full, repository namespaced image name to build (without the tag).'
         required: true
@@ -267,7 +274,11 @@ jobs:
           echo "Building '$resolved' with context '$context'"
         shell: bash
       -
-        # The replacement for the old build-themes step. Deliberately reachable only through
+        name: Build Themes
+        if: inputs.build-themes
+        uses: unb-libraries/github-workflows/.github/actions/build-themes@1.x
+      -
+        # A general hook for any other asset build. Deliberately reachable only through
         # workflow_call: this interpolates into a run: block, so it must never be settable
         # from a workflow_dispatch form. Runs once per platform job, on that job's runner.
         name: Pre-build command

@@ -1,0 +1,21 @@
+name: Build Drupal Themes
+description: >-
+  Runs the application's own dockworker theme:build-all, after installing the distribution
+  PHP, Composer and Dart Sass it needs. The calling repository must require dockworker in its
+  composer.json.
+
+inputs:
+  sass-version:
+    description: 'Dart Sass release to build with. Default 1.62.1, as in dockworker 6.x.'
+    required: false
+    default: '1.62.1'
+
+runs:
+  using: composite
+  steps:
+    -
+      name: Build Themes
+      shell: bash
+      env:
+        SASS_VERSION: ${{ inputs.sass-version }}
+      run: bash "$GITHUB_ACTION_PATH/build-themes.sh"

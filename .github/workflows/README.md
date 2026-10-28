@@ -8,7 +8,8 @@ next push. Additive, optional inputs whose defaults preserve current behavior ar
 safe way to change a workflow's interface.
 
 They were extracted from `unb-libraries/dockworker`, which is being deprecated. Nothing
-here requires PHP, composer, or the dockworker package.
+here requires PHP, composer, or the dockworker package, except the opt-in `build-themes`, which
+runs the application's own dockworker.
 
 ## Entry points
 
@@ -70,8 +71,8 @@ line and remove the inputs below.
 
 | `dockworker@6.x` input | Here |
 |---|---|
-| `build-themes: true` | **Removed.** Use `pre-build-command` with the app's own build command. There is no PHP in this repository. |
-| `php-version`, `composer-version` | **Removed.** Nothing here runs PHP. |
+| `build-themes: true` | Unchanged. Now the [`build-themes` action](#build-themes); the app's own `vendor/bin/dockworker` still does the build. |
+| `php-version`, `composer-version` | **Removed.** `build-themes` uses the runner distribution's PHP and Composer. |
 | `run-log-check` | Replaced by `check-logs` (**defaults false**). Set `log-check-profile: drupal` to get dockworker-drupal's exceptions. The check is the PHP-free `check-logs` action, not `vendor/bin/dockworker logs:check-file`; see [Deployment log check](#deployment-log-check). |
 | `push-branches`, `push-all-branches` | **Removed.** Already declared-but-ignored in 6.x; every branch is tagged by its sanitized branch name. |
 | — | `pre-build-command` (new) |
@@ -152,9 +153,24 @@ That is benign when one repository owns that tag, and it is why a `helm upgrade`
 followed by a re-run of the deploy workflow whenever more than one repository pushes to the
 same image name.
 
+## `build-themes`
+
+```yaml
+    with:
+      build-themes: true
+```
+
+Runs the `build-themes` action (`.github/actions/build-themes`) after checkout and before
+`pre-build-command`. It installs the runner distribution's PHP (with `ext-yaml`), Composer and
+Dart Sass 1.62.1, runs `composer install`, then runs the application's own
+`vendor/bin/dockworker theme:build-all` under a pseudo-TTY. When the repository has
+a `custom/themes` directory, the step fails if no `custom/themes/*/dist/css/*.css` exists
+afterwards. The theme build logic stays in dockworker;
+this repository only provisions the toolchain.
+
 ## `pre-build-command`
 
-The de-PHP'd replacement for `build-themes`. It runs in the repository root, under `bash`,
+A general hook for any other asset build. It runs in the repository root, under `bash`,
 after checkout and before the image build:
 
 ```yaml
@@ -231,7 +247,7 @@ else on `amd64-runner` (default `ubuntu-latest`) -- pushes each by digest, and a
 and pushes its tags directly. `distribute: false` builds every platform in one job, emulating
 non-amd64 platforms under QEMU. At most four platforms can be distributed.
 
-`pre-build-command` runs once in **each** platform job, on that job's runner.
+`build-themes` and `pre-build-command` run once in **each** platform job, on that job's runner.
 
 Layers are pushed with `compression: zstd` by default (OCI media types), which needs
 containerd 1.5+ / Docker 23+ wherever the image is pulled. Set `compression: gzip` for older

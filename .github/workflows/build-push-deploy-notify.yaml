@@ -19,6 +19,11 @@ on:
         description: 'The name(s) of the kubernetes deployment(s) to update. Supports CSV for multiple deployments (e.g., "deploy1,deploy2"). Each name must equal its pod container name.'
         required: true
         type: string
+      build-themes:
+        description: 'Build the Drupal theme assets with dockworker theme:build-all before the image build. Default false.'
+        required: false
+        type: boolean
+        default: false
       pre-build-command:
         description: 'Optional shell command run in the repository root before the image build. See build-push.yaml.'
         required: false
@@ -122,6 +127,7 @@ jobs:
     uses: unb-libraries/github-workflows/.github/workflows/build-push.yaml@1.x
     with:
       image-name: ${{ inputs.image-name }}
+      build-themes: ${{ inputs.build-themes }}
       pre-build-command: ${{ inputs.pre-build-command }}
       platforms: ${{ inputs.platforms }}
       build-cache: ${{ inputs.build-cache }}
