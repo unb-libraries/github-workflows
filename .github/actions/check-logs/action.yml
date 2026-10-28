@@ -1,0 +1,29 @@
+name: Check Deployment Logs
+description: >-
+  Fails if a deployment log contains error lines. A PHP-free port of dockworker's
+  logs:check-file; see check_logs.py for the classification rules.
+
+inputs:
+  log-file:
+    description: 'Path to the log file to check.'
+    required: true
+  profile:
+    description: 'Exception set to apply: "generic" (none) or "drupal". Default generic.'
+    required: false
+    default: generic
+  extra-exceptions:
+    description: 'Additional newline-delimited exception patterns (case-insensitive regular expressions). A line matching one is not an error.'
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    -
+      name: Check Logs for Errors
+      shell: bash
+      env:
+        LOG_FILE: ${{ inputs.log-file }}
+        PROFILE: ${{ inputs.profile }}
+        EXTRA_EXCEPTIONS: ${{ inputs.extra-exceptions }}
+      run: python3 "$GITHUB_ACTION_PATH/check_logs.py" "$LOG_FILE" --profile "$PROFILE" --extra-exceptions "$EXTRA_EXCEPTIONS"

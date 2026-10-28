@@ -1,0 +1,35 @@
+# Exception patterns for Drupal applications: an error line that also matches any of these
+# is not an error. Case-insensitive regular expressions, one per line.
+# Ported from dockworker-drupal's DrupalDeployCommands::provideErrorLogConfiguration().
+
+# Drupal 11 local: expected.
+Access denied for user 'drupal'
+# Drupal 10: a module, not an error.
+inline_form_errors
+# Drupal 10: expected.
+Config language.entity.en does not exist
+# Migrate processes reporting 0 failed. The leading space is significant.
+[ ]0 failed
+# Drupal 9 local: expected.
+Operation CREATE USER failed
+# Composer summary output.
+failure: 0
+# Composer suggest output.
+error-handler instead
+# .well-known trolling.
+.well-known
+# Calendar template name.
+HoursCalendarUnavailableTemplate
+# Drush auto-answers "yes" to a non-fatal requirements check and continues.
+Do you wish to continue\?: yes
+# Drupal-core config-schema warning prose. Schema warnings are '[warning]'-level and so are
+# not scanned, but Drush wraps long ones across lines, leaving unmarked continuation lines.
+# The wrap-tails are anchored so a genuine "...failed with errors:" line is never excepted.
+following errors:\s*$
+(\||^)\s*errors:\s*$
+These errors mean there
+is configuration that does not comply with its schema
+does not comply with its schema
+not a fatal error, but it is
+recommended to fix these issues
+missing schema

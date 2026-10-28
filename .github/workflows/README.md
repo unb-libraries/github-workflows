@@ -72,7 +72,7 @@ line and remove the inputs below.
 |---|---|
 | `build-themes: true` | **Removed.** Use `pre-build-command` with the app's own build command. There is no PHP in this repository. |
 | `php-version`, `composer-version` | **Removed.** Nothing here runs PHP. |
-| `run-log-check` | **Removed** along with `test-logs.yaml`, which ran `vendor/bin/dockworker logs:check-file`. `collect-logs` still uploads the `deployment-logs` artifact if you want the logs. |
+| `run-log-check` | Replaced by `check-logs` (**defaults false**). Set `log-check-profile: drupal` to get dockworker-drupal's exceptions. The check is the PHP-free `check-logs` action, not `vendor/bin/dockworker logs:check-file`; see [Deployment log check](#deployment-log-check). |
 | `push-branches`, `push-all-branches` | **Removed.** Already declared-but-ignored in 6.x; every branch is tagged by its sanitized branch name. |
 | — | `pre-build-command` (new) |
 | — | `collect-logs` (new; was slaved to `run-log-check`, now independent and **defaults false**) |
@@ -81,12 +81,41 @@ line and remove the inputs below.
 | — | `build-cache` (new, default true) |
 
 Workflows deliberately **not** carried over: `test-unit`, `test-e2e`, `test-api`,
-`test-logs`, `update`, `update-docker-compose`, `install-test`, `workflow-os`,
+`test-logs` (replaced by the `check-logs` action), `update`, `update-docker-compose`, `install-test`, `workflow-os`,
 `trim-registry-images` (deprecated in favour of `unb-libraries/container-image-pruner`),
 and `build-push-test-deploy-notify` (zero consumers, and its `needs:` chain is broken --
 `build-push-images` hard-depends on a job that skips whenever `test` omits `unit`).
 `update.yaml` remains in dockworker: it is a `vendor/bin/dockworker update` wrapper and
 belongs to that package's local-development surface.
+
+## Deployment log check
+
+With `check-logs: true`, `build-push-deploy-notify.yaml` collects the post-rollout container
+logs (`collect-logs` is implied) and the `Check New Deployment Logs` job fails the run if any
+line is an error. It runs only when the deploy did, and `Notify Conclusion` waits for it.
+
+```yaml
+    with:
+      check-logs: true
+      log-check-profile: drupal
+      log-check-exceptions: |
+        Some known-benign line that says failed
+```
+
+The check is `.github/actions/check-logs`, a stdlib-only Python port of dockworker's
+`logs:check-file`, with byte-identical verdicts on 135 real 6.x deployment logs:
+
+- Drush severity markers are honoured: `[warning]` lines are reported but never fail the
+  check; `[notice]`, `[success]`, `[ok]`, `[info]`, `[debug]` and `[cancelled]` lines are
+  ignored; the `drush updatedb` pending-updates preview table is ignored.
+- Any other line containing `error`, `fail`, `fatal`, `unable`, `unavailable`,
+  `unrecognized`, `unresolved`, `unsuccessful` or `unsupported` (case-insensitive) fails the
+  check, unless it matches an exception pattern.
+- Exception patterns come from the profile (`rules/drupal.exceptions`; `generic` has none)
+  plus `log-check-exceptions`. Add an app-specific exception there rather than to a profile.
+
+Run the tests with `python3 -m unittest .github/actions/check-logs/test_check_logs.py`
+from the action directory.
 
 ## Image tagging
 

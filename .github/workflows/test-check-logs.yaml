@@ -1,0 +1,20 @@
+name: Test check-logs action
+
+# Unlike the other files here, this is not a reusable workflow: it tests this repository.
+on:
+  pull_request:
+    paths: [ '.github/actions/check-logs/**' ]
+  push:
+    paths: [ '.github/actions/check-logs/**' ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      -
+        name: Run tests
+        working-directory: .github/actions/check-logs
+        run: python3 -m unittest -v test_check_logs.py

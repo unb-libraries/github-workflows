@@ -49,6 +49,21 @@ on:
         required: false
         type: boolean
         default: false
+      check-logs:
+        description: 'Fail the run if the post-rollout container logs contain error lines. Implies collect-logs. Default false.'
+        required: false
+        type: boolean
+        default: false
+      log-check-profile:
+        description: 'Exception set for check-logs: "generic" (none) or "drupal". Default generic.'
+        required: false
+        type: string
+        default: generic
+      log-check-exceptions:
+        description: 'Additional newline-delimited exception patterns for check-logs (case-insensitive regular expressions). A line matching one is not an error.'
+        required: false
+        type: string
+        default: ''
       rollout-timeout:
         description: 'Timeout passed to `kubectl rollout status`. Default 10m.'
         required: false
@@ -131,10 +146,38 @@ jobs:
       deploy-branches: ${{ inputs.deploy-branches }}
       k8s-deployment-name: ${{ inputs.k8s-deployment-name }}
       image-full-name: ${{ needs.build-push-images.outputs.image-full-name }}
-      collect-logs: ${{ inputs.collect-logs }}
+      collect-logs: ${{ inputs.collect-logs || inputs.check-logs }}
       rollout-timeout: ${{ inputs.rollout-timeout }}
     secrets:
       KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+
+  check-deployment-logs:
+    name: Check New Deployment Logs
+    needs: [ deploy-image-to-k8s ]
+    # Skipped along with the deploy on non-deploy branches.
+    if: ${{ inputs.check-logs }}
+    runs-on: ubuntu-latest
+    steps:
+      -
+        name: Retrieve The Log Artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: deployment-logs
+          path: /tmp/logs
+      -
+        uses: unb-libraries/github-workflows/.github/actions/check-logs@1.x
+        with:
+          log-file: /tmp/logs/deployment_logs.txt
+          profile: ${{ inputs.log-check-profile }}
+          extra-exceptions: ${{ inputs.log-check-exceptions }}
+      -
+        name: Display Full Logs
+        # Without always() this is skipped exactly when the check fails, which is the only
+        # time the logs are needed. The fallback keeps a missing artifact from adding a
+        # second, misleading failure.
+        if: always()
+        run: cat /tmp/logs/deployment_logs.txt || echo "No log file at /tmp/logs/deployment_logs.txt"
+        shell: bash
 
   prune-old-images:
     name: Prune Old Images
@@ -155,7 +198,7 @@ jobs:
   notify-conclusion:
     name: Notify Conclusion
     uses: unb-libraries/github-workflows/.github/workflows/notify-conclusion.yaml@1.x
-    needs: [ deploy-image-to-k8s ]
+    needs: [ deploy-image-to-k8s, check-deployment-logs ]
     if: always()
     secrets:
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

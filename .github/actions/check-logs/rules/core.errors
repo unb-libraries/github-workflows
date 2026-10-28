@@ -1,0 +1,12 @@
+# Error patterns: a scanned line matching any of these fails the check, unless it also
+# matches an exception pattern. Case-insensitive regular expressions, one per line.
+# Ported from dockworker's LogCheckerTrait::getAllLogErrorStrings().
+error
+fail
+fatal
+unable
+unavailable
+unrecognized
+unresolved
+unsuccessful
+unsupported
