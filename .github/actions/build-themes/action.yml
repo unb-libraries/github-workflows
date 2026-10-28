@@ -1,21 +1,84 @@
 name: Build Drupal Themes
 description: >-
-  Runs the application's own dockworker theme:build-all, after installing the distribution
-  PHP, Composer and Dart Sass it needs. The calling repository must require dockworker in its
-  composer.json.
+  Runs the application's own dockworker theme:build-all once, after installing a pinned PHP,
+  Composer and Dart Sass, then verifies every stylesheet was built. The calling repository
+  must require unb-libraries/dockworker-drupal in its composer.json.
 
 inputs:
+  php-version:
+    description: 'PHP version installed with shivammathur/setup-php. Default 8.4.'
+    required: false
+    default: '8.4'
+  composer-version:
+    description: 'Composer version installed with setup-php. Default 2.10.2.'
+    required: false
+    default: '2.10.2'
   sass-version:
     description: 'Dart Sass release to build with. Default 1.62.1, as in dockworker 6.x.'
     required: false
     default: '1.62.1'
 
+outputs:
+  dist-dirs:
+    description: 'Newline-separated, repository-relative dist directories of the built themes.'
+    value: ${{ steps.verify.outputs.dist-dirs }}
+
 runs:
   using: composite
   steps:
     -
-      name: Build Themes
+      name: Install PHP
+      uses: shivammathur/setup-php@v2
+      env:
+        # Without this, setup-php only warns when an extension fails to install.
+        fail-fast: true
+      with:
+        php-version: ${{ inputs.php-version }}
+        coverage: none
+        tools: composer:${{ inputs.composer-version }}
+        extensions: curl,dom,gd,mbstring,posix,yaml,zip
+    -
+      name: Install Dart Sass
+      id: sass
       shell: bash
       env:
         SASS_VERSION: ${{ inputs.sass-version }}
-      run: bash "$GITHUB_ACTION_PATH/build-themes.sh"
+      run: bash "$GITHUB_ACTION_PATH/install-sass.sh"
+    -
+      name: Install dockworker
+      shell: bash
+      env:
+        COMPOSER_NO_INTERACTION: '1'
+      run: |
+        set -euo pipefail
+        # Anything dockworker builds must be newer than this; see verify-themes.sh.
+        touch "$RUNNER_TEMP/theme-build-start"
+        # --no-scripts: the repositories gitignore composer.lock, so this install resolves
+        # like an update and would run post-update-cmd (dockworker git:setup-hooks).
+        composer install --prefer-dist --no-progress --no-scripts
+        if [ ! -x vendor/bin/dockworker ]; then
+          echo "::error title=dockworker missing::composer install did not provide vendor/bin/dockworker. Require unb-libraries/dockworker-drupal in composer.json to use build-themes."
+          exit 1
+        fi
+    -
+      name: Build Themes
+      shell: bash
+      env:
+        # dockworker never uses a TTY when CI is set (CliCommand::isTtySupported).
+        CI: 'true'
+        COMPOSER_NO_INTERACTION: '1'
+        SASS_PATH: ${{ steps.sass.outputs.path }}
+      run: vendor/bin/dockworker theme:build-all
+    -
+      name: Verify Theme Output
+      id: verify
+      shell: bash
+      run: |
+        set -euo pipefail
+        list="$RUNNER_TEMP/theme-dist-dirs"
+        bash "$GITHUB_ACTION_PATH/verify-themes.sh" . "$RUNNER_TEMP/theme-build-start" "$list"
+        {
+          echo "dist-dirs<<DIST_DIRS_EOF"
+          cat "$list"
+          echo "DIST_DIRS_EOF"
+        } >> "$GITHUB_OUTPUT"

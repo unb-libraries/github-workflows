@@ -10,6 +10,7 @@ jobs:
   slack-start:
     name: Notify of Start
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
     steps:
@@ -28,6 +29,13 @@ jobs:
           MESSAGE=$(jq -r '.commit.message // ""' <<<"$COMMIT_JSON")
           AUTHOR=$(jq -r '.commit.author.name // ""' <<<"$COMMIT_JSON")
           [ -z "$AUTHOR" ] && AUTHOR="$ACTOR"
+          # Slack mrkdwn treats &, < and > as markup: an unescaped "<x>" in a commit message is
+          # swallowed or becomes a mention, and a stray ">" can break the <url|text> links.
+          slack_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' <<<"$1"; }
+          MESSAGE=$(slack_escape "$MESSAGE")
+          AUTHOR=$(slack_escape "$AUTHOR")
+          WORKFLOW=$(slack_escape "$WORKFLOW")
+          REF_NAME=$(slack_escape "$REF_NAME")
           SHORT_SHA=${SHA:0:7}
           RUN_URL="${GITHUB_SERVER_URL}/${REPO}/actions/runs/${RUN_ID}"
           COMMIT_URL="${GITHUB_SERVER_URL}/${REPO}/commit/${SHA}"

@@ -13,9 +13,13 @@ logsHaveErrors, plus dockworker-drupal's exception list) with no PHP dependency.
      the check, unless the same line also matches an exception pattern.
 
 Patterns are case-insensitive regular expressions, read one per line from the rules
-directory: core.errors always, plus <profile>.exceptions for the chosen profile.
+directory: core.errors always, plus <profile>.exceptions for the chosen profile, plus any
+extra exceptions. Each pattern is compiled on its own first, so an invalid one is reported
+with its source and line, and is grouped before joining, so one pattern's alternation can
+never swallow the rest.
 
-Exit status: 0 when no errors are found, 1 when errors are found or the log is unreadable.
+Exit status: 0 when no errors are found, 1 when errors are found, the log is unreadable or
+a pattern is invalid.
 """
 
 import argparse
@@ -34,20 +38,37 @@ UPDB_CONFIRM = "Do you wish to run the specified pending updates"
 UPDB_PREVIEW_LINE_CAP = 2000
 
 
+class PatternError(ValueError):
+    """An empty or invalid pattern, with where it came from."""
+
+
 def read_rules(path):
-    """Returns the patterns in a rules file, skipping blank and '#' comment lines."""
-    patterns = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if line and not line.startswith("#"):
-            patterns.append(line)
-    return patterns
+    """Returns (line number, pattern) for a rules file, skipping blank and '#' comment lines."""
+    entries = []
+    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if line.strip() and not line.startswith("#"):
+            entries.append((lineno, line))
+    return entries
 
 
-def compile_alternation(patterns):
-    """Joins patterns into one case-insensitive alternation, or None when there are none."""
-    if not patterns:
+def compile_alternation(entries, source):
+    """Joins (line number, pattern) entries into one case-insensitive alternation of groups.
+
+    Returns None when there are none. Raises PatternError naming the source and line of an
+    empty or invalid pattern.
+    """
+    if not entries:
         return None
-    return re.compile("(?:" + "|".join(patterns) + ")", re.I)
+    groups = []
+    for lineno, pattern in entries:
+        if not pattern.strip():
+            raise PatternError(f"{source} line {lineno}: empty pattern.")
+        try:
+            re.compile(pattern, re.I)
+        except re.error as e:
+            raise PatternError(f"{source} line {lineno}: {pattern!r}: {e}.") from e
+        groups.append(f"(?:{pattern})")
+    return re.compile("|".join(groups), re.I)
 
 
 def is_updb_preview_header(line):
@@ -112,13 +133,22 @@ def check(text, errors, exceptions):
 
 
 def load_patterns(profile, extra_exceptions=""):
-    errors = read_rules(RULES_DIR / "core.errors")
+    """Returns the compiled (errors, exceptions) patterns. Raises PatternError."""
+    errors = compile_alternation(read_rules(RULES_DIR / "core.errors"), "rules/core.errors")
     exceptions = []
     profile_rules = RULES_DIR / f"{profile}.exceptions"
     if profile_rules.exists():
-        exceptions += read_rules(profile_rules)
-    exceptions += [p for p in extra_exceptions.split("\n") if p.strip()]
-    return compile_alternation(errors), compile_alternation(exceptions)
+        source = f"rules/{profile_rules.name}"
+        exceptions += [(source, lineno, p) for lineno, p in read_rules(profile_rules)]
+    exceptions += [
+        ("extra-exceptions", lineno, p)
+        for lineno, p in enumerate(extra_exceptions.split("\n"), start=1)
+        if p.strip()
+    ]
+    # Validate each against its own source, then compile them together.
+    for source, lineno, pattern in exceptions:
+        compile_alternation([(lineno, pattern)], source)
+    return errors, compile_alternation([(lineno, p) for _, lineno, p in exceptions], "exceptions")
 
 
 def main():
@@ -147,7 +177,11 @@ def main():
         print(f"::error title=Unreadable log::Log file [{args.log_file}] is not readable: {e}")
         return 1
 
-    errors, exceptions = load_patterns(args.profile, args.extra_exceptions)
+    try:
+        errors, exceptions = load_patterns(args.profile, args.extra_exceptions)
+    except PatternError as e:
+        print(f"::error title=Invalid pattern::{e}")
+        return 1
     error_lines, warnings = check(text, errors, exceptions)
 
     if error_lines:

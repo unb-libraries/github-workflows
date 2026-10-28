@@ -17,7 +17,7 @@ failure: 0
 # Composer suggest output.
 error-handler instead
 # .well-known trolling.
-.well-known
+\.well-known
 # Calendar template name.
 HoursCalendarUnavailableTemplate
 # Drush auto-answers "yes" to a non-fatal requirements check and continues.

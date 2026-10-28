@@ -5,20 +5,34 @@ on:
     inputs:
       build-themes:
         description: >-
-          Build the Drupal theme assets with the application's own dockworker theme:build-all
-          before the image build. Runs before pre-build-command. Default false.
+          Build the Drupal theme assets once with the application's own dockworker
+          theme:build-all, verify them, and carry them into every platform build. Runs before
+          pre-build-command. Default false.
         required: false
         type: boolean
         default: false
+      php-version:
+        description: 'PHP version installed for build-themes (shivammathur/setup-php). Default 8.4.'
+        required: false
+        type: string
+        default: '8.4'
       image-name:
         description: 'The full, repository namespaced image name to build (without the tag).'
         required: true
         type: string
       pre-build-command:
         description: >-
-          Optional shell command run in the repository root before the image build, e.g. an
-          asset or theme build. Runs under bash with the repository checked out. Default
-          empty, which skips the step entirely.
+          Optional shell command run once, in the repository root on an amd64 runner, before
+          the image builds, e.g. an asset build. Its outputs must be architecture-neutral.
+          Requires pre-build-outputs. Default empty, which skips it.
+        required: false
+        type: string
+        default: ''
+      pre-build-outputs:
+        description: >-
+          Newline-separated, repository-relative paths or bash globs (globstar enabled) that
+          pre-build-command produces. Only these are carried into the platform builds. Each
+          entry must match something. Required when pre-build-command is set.
         required: false
         type: string
         default: ''
@@ -37,6 +51,11 @@ on:
         required: false
         type: boolean
         default: true
+      cache-backend:
+        description: 'TEMPORARY (harden branch A/B only): gha, registry or none.'
+        required: false
+        type: string
+        default: gha
       docker-build-record-retention-days:
         description: 'Number of days to retain Docker build records.'
         required: false
@@ -94,14 +113,22 @@ on:
       GH_CONTAINER_REGISTRY_TOKEN:
         description: 'The token to use to login to the GitHub Container Registry.'
         required: true
+      GH_NPM_TOKEN:
+        description: >-
+          Optional token for the GitHub npm registry. Always exposed to the image build as the
+          npmrc build secret (empty without a token), so a Dockerfile can use
+          --mount=type=secret,id=npmrc unconditionally.
+        required: false
 
 jobs:
-  # Computes the tags once (so every platform job and the merge share one timestamp) and plans
-  # one build job per platform. Must not reference secrets: job outputs that may contain a
-  # secret value are silently dropped by the runner.
+  # Computes the tags once (so every platform job and the merge share one timestamp), plans
+  # one build job per platform, and builds architecture-neutral assets (themes, the
+  # pre-build command) once for all of them. Must not reference secrets: job outputs that may
+  # contain a secret value are silently dropped by the runner.
   prepare:
     name: Prepare Build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     outputs:
       tags: ${{ steps.fetch-push-tags.outputs.tags }}
       image-tag: ${{ steps.image-tag.outputs.image-tag }}
@@ -165,6 +192,7 @@ jobs:
         name: Plan Platforms
         id: plan-platforms
         env:
+          IMAGE_NAME: ${{ inputs.image-name }}
           PLATFORMS: ${{ inputs.platforms }}
           DISTRIBUTE: ${{ inputs.distribute }}
           ARM64_RUNNER: ${{ inputs.arm64-runner }}
@@ -176,10 +204,11 @@ jobs:
           # CPUs often cannot execute natively) builds on the amd64 runner under emulation.
           # With distribute=false, a single entry builds every platform in one job.
           # The build job declares a fixed digest_0..digest_3 output per entry, hence the cap.
-          # cache-scope keeps each platform's BuildKit cache separate, so parallel jobs do not
-          # overwrite each other's cache.
+          # cache-scope keeps each image's and platform's BuildKit cache separate, so parallel
+          # jobs, and two images built from one repository, never overwrite each other's cache.
           max=4
           matrix="$(jq -cn \
+            --arg image "$IMAGE_NAME" \
             --arg platforms "$PLATFORMS" \
             --argjson distribute "$DISTRIBUTE" \
             --arg arm64 "$ARM64_RUNNER" \
@@ -196,7 +225,7 @@ jobs:
               else
                 [{platform: join(","), runner: $amd64, index: 0}]
               end
-            | map(. + {"cache-scope": ("buildkit-" + (.platform | gsub("[^A-Za-z0-9_.-]+"; "-")))})
+            | map(. + {"cache-scope": (($image + "-" + .platform) | gsub("[^A-Za-z0-9_.-]+"; "-"))})
             | {include: .}')"
           count="$(jq '.include | length' <<<"$matrix")"
           if [ "$count" -eq 0 ]; then
@@ -216,11 +245,93 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           jq -r '.include[] | "Planned \(.platform) on \(.runner)"' <<<"$matrix"
         shell: bash
+      - uses: actions/checkout@v7
+        if: inputs.build-themes || inputs.pre-build-command != ''
+        with:
+          fetch-depth: ${{ inputs.checkout-fetch-depth }}
+      -
+        name: Build Themes
+        id: build-themes
+        if: inputs.build-themes
+        uses: unb-libraries/github-workflows/.github/actions/build-themes@harden
+        with:
+          php-version: ${{ inputs.php-version }}
+      -
+        # A general hook for any other asset build. Deliberately reachable only through
+        # workflow_call: this interpolates into a run: block, so it must never be settable
+        # from a workflow_dispatch form. Runs once; only pre-build-outputs reach the image.
+        name: Pre-build command
+        if: inputs.pre-build-command != ''
+        run: ${{ inputs.pre-build-command }}
+        shell: bash
+      -
+        name: Pack Built Assets
+        if: inputs.build-themes || inputs.pre-build-command != ''
+        env:
+          THEME_DIST_DIRS: ${{ steps.build-themes.outputs.dist-dirs }}
+          PRE_BUILD_COMMAND: ${{ inputs.pre-build-command }}
+          PRE_BUILD_OUTPUTS: ${{ inputs.pre-build-outputs }}
+          ARCHIVE: ${{ runner.temp }}/build-push-assets.tar
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob dotglob
+          trim() { local v="${1#"${1%%[![:space:]]*}"}"; printf '%s' "${v%"${v##*[![:space:]]}"}"; }
+
+          paths=()
+          while IFS= read -r line; do
+            line="$(trim "$line")"
+            [ -n "$line" ] && paths+=("$line")
+          done <<<"$THEME_DIST_DIRS"
+
+          declared="$(trim "$PRE_BUILD_OUTPUTS")"
+          if [ -n "$PRE_BUILD_COMMAND" ] && [ -z "$declared" ]; then
+            echo "::error title=pre-build-outputs required::pre-build-command is set but pre-build-outputs is empty, so nothing it built would reach the image. List the paths it writes."
+            exit 1
+          fi
+          if [ -z "$PRE_BUILD_COMMAND" ] && [ -n "$declared" ]; then
+            echo "::error title=pre-build-outputs without command::pre-build-outputs is set but pre-build-command is empty."
+            exit 1
+          fi
+          while IFS= read -r pattern; do
+            pattern="$(trim "$pattern")"
+            [ -z "$pattern" ] && continue
+            case "/$pattern/" in
+              //*|*/../*)
+                echo "::error title=Invalid pre-build-outputs entry::'$pattern' must be a relative path inside the repository."
+                exit 1 ;;
+            esac
+            # Deliberate glob expansion of a declared pattern; IFS is a newline so spaces survive.
+            matches=()
+            IFS=$'\n' read -r -d '' -a matches < <(compgen -G "$pattern" && printf '\0') || true
+            if [ "${#matches[@]}" -eq 0 ]; then
+              echo "::error title=pre-build-outputs matched nothing::'$pattern' matched nothing after pre-build-command ran."
+              exit 1
+            fi
+            paths+=("${matches[@]}")
+          done <<<"$declared"
+
+          tar -cf "$ARCHIVE" -- "${paths[@]}"
+          echo "Packed $(tar -tf "$ARCHIVE" | wc -l) entries from:"
+          printf '  %s\n' "${paths[@]}"
+        shell: bash
+      -
+        # Internal to this workflow, unlike build-image-tag: not a consumer contract.
+        name: Upload Built Assets
+        if: inputs.build-themes || inputs.pre-build-command != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-push-assets
+          path: ${{ runner.temp }}/build-push-assets.tar
+          retention-days: 3
+          if-no-files-found: error
+          overwrite: true
 
   build-image:
     name: Build Image (${{ matrix.platform }})
     needs: prepare
     runs-on: ${{ matrix.runner }}
+    # Emulated builds (distribute: false, or a platform without a native runner) are far slower.
+    timeout-minutes: ${{ inputs.distribute && 90 || 360 }}
     strategy:
       fail-fast: true
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
@@ -274,16 +385,24 @@ jobs:
           echo "Building '$resolved' with context '$context'"
         shell: bash
       -
-        name: Build Themes
-        if: inputs.build-themes
-        uses: unb-libraries/github-workflows/.github/actions/build-themes@1.x
+        name: Download Built Assets
+        if: inputs.build-themes || inputs.pre-build-command != ''
+        uses: actions/download-artifact@v8
+        with:
+          name: build-push-assets
+          path: ${{ runner.temp }}/build-push-assets
       -
-        # A general hook for any other asset build. Deliberately reachable only through
-        # workflow_call: this interpolates into a run: block, so it must never be settable
-        # from a workflow_dispatch form. Runs once per platform job, on that job's runner.
-        name: Pre-build command
-        if: inputs.pre-build-command != ''
-        run: ${{ inputs.pre-build-command }}
+        name: Unpack Built Assets
+        if: inputs.build-themes || inputs.pre-build-command != ''
+        env:
+          ARCHIVE: ${{ runner.temp }}/build-push-assets/build-push-assets.tar
+        run: |
+          set -euo pipefail
+          if [ ! -s "$ARCHIVE" ]; then
+            echo "::error title=Missing built assets::$ARCHIVE is missing or empty. If the artifact expired, re-run all jobs rather than only the failed ones."
+            exit 1
+          fi
+          tar -xvf "$ARCHIVE" -C "$GITHUB_WORKSPACE"
         shell: bash
       -
         name: Set up Docker Buildx
@@ -300,12 +419,29 @@ jobs:
           username: ${{ secrets.GH_CONTAINER_REGISTRY_USER }}
           password: ${{ secrets.GH_CONTAINER_REGISTRY_TOKEN }}
       -
+        name: Write npmrc build secret
+        env:
+          GH_NPM_TOKEN: ${{ secrets.GH_NPM_TOKEN }}
+        run: |
+          umask 077
+          if [ -n "$GH_NPM_TOKEN" ]; then
+            echo "//npm.pkg.github.com/:_authToken=$GH_NPM_TOKEN" > "$RUNNER_TEMP/npmrc"
+          else
+            : > "$RUNNER_TEMP/npmrc"
+          fi
+        shell: bash
+      -
         name: Resolve Build Options
         id: build-options
         env:
           MULTI: ${{ needs.prepare.outputs.multi }}
           IMAGE_NAME: ${{ inputs.image-name }}
           COMPRESSION: ${{ inputs.compression }}
+          BUILD_CACHE: ${{ inputs.build-cache }}
+          CACHE_BACKEND: ${{ inputs.cache-backend }}
+          CACHE_SCOPE: ${{ matrix.cache-scope }}
+          PLATFORM: ${{ matrix.platform }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
           # With several matrix jobs, each pushes its platform image untagged (by digest) and
@@ -320,7 +456,30 @@ jobs:
             zstd) output="$output,compression=zstd,oci-mediatypes=true" ;;
             *) echo "::error title=Invalid compression::compression must be 'zstd' or 'gzip', got '$COMPRESSION'."; exit 1 ;;
           esac
-          echo "output=$output" >> "$GITHUB_OUTPUT"
+
+          cache_from=""
+          cache_to=""
+          if [ "$BUILD_CACHE" = "true" ]; then
+            case "$CACHE_BACKEND" in
+              gha)
+                cache_from="type=gha,scope=$CACHE_SCOPE"
+                cache_to="type=gha,mode=max,scope=$CACHE_SCOPE" ;;
+              registry)
+                ref="$IMAGE_NAME:buildcache-$(printf '%s' "$PLATFORM" | sed -E 's/[^A-Za-z0-9_.-]+/-/g')"
+                cache_from="type=registry,ref=$ref"
+                # Pull requests read the cache but never write it.
+                if [ "$EVENT_NAME" = "push" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+                  cache_to="type=registry,ref=$ref,mode=max,image-manifest=true,oci-mediatypes=true,compression=$COMPRESSION"
+                fi ;;
+              none) ;;
+              *) echo "::error title=Invalid cache-backend::'$CACHE_BACKEND'"; exit 1 ;;
+            esac
+          fi
+          {
+            echo "output=$output"
+            echo "cache-from=$cache_from"
+            echo "cache-to=$cache_to"
+          } >> "$GITHUB_OUTPUT"
         shell: bash
       -
         id: build
@@ -338,8 +497,10 @@ jobs:
           file: ${{ inputs.dockerfile }}
           tags: ${{ needs.prepare.outputs.multi != 'true' && needs.prepare.outputs.tags || '' }}
           outputs: ${{ steps.build-options.outputs.output }}
-          cache-from: ${{ inputs.build-cache && format('type=gha,scope={0}', matrix.cache-scope) || '' }}
-          cache-to: ${{ inputs.build-cache && format('type=gha,mode=max,scope={0}', matrix.cache-scope) || '' }}
+          cache-from: ${{ steps.build-options.outputs.cache-from }}
+          cache-to: ${{ steps.build-options.outputs.cache-to }}
+          secret-files: |
+            npmrc=${{ runner.temp }}/npmrc
           build-args: |
             BUILD_DATE=${{ needs.prepare.outputs.build-date }}
             VCS_REF=${{ github.ref_name }}
@@ -385,6 +546,7 @@ jobs:
     needs: [ prepare, build-image ]
     if: needs.prepare.outputs.multi == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       # No setup-buildx here: imagetools only talks to the registry, and the runner's
       # preinstalled buildx plugin is enough for that.

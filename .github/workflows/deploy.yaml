@@ -21,19 +21,39 @@ on:
         type: string
       collect-logs:
         description: >-
-          Collect post-rollout container logs and upload them as the deployment-logs
-          artifact. Adds a 60s settle wait before reading. Default false.
+          Collect post-rollout container logs from every pod and container of each deployment
+          and upload them as the deployment-logs artifact. Default false.
         required: false
         type: boolean
         default: false
+      log-settle-seconds:
+        description: >-
+          Seconds to wait after the rollout before collecting logs, so output written just
+          after the pod became ready is included. Default 60, as in dockworker 6.x.
+        required: false
+        type: number
+        default: 60
       rollout-timeout:
         description: >-
           Timeout passed to `kubectl rollout status`. Without one, an image that
-          CrashLoopBackOffs blocks the job until GitHub''s 6-hour ceiling instead of
+          CrashLoopBackOffs blocks the job until GitHub's 6-hour ceiling instead of
           failing. Default 10m.
         required: false
         type: string
         default: '10m'
+      deploy-timeout-minutes:
+        description: >-
+          Job timeout. Expressions cannot do arithmetic, so set this to at least
+          rollout-timeout times the number of deployments in k8s-deployment-name, plus
+          log-settle-seconds and five minutes. Default 30.
+        required: false
+        type: number
+        default: 30
+      kubectl-version:
+        description: 'kubectl release to install. Keep it within one minor version of the cluster API server. Default v1.31.0.'
+        required: false
+        type: string
+        default: 'v1.31.0'
     secrets:
       KUBE_CONFIG:
         required: true
@@ -44,17 +64,45 @@ jobs:
       contains(fromJSON(inputs.deploy-branches), github.ref_name)
     name: Deploy New Image to Kubernetes Cluster
     runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.deploy-timeout-minutes }}
+    # Two runs for the same branch would otherwise roll out the same deployments concurrently,
+    # and the older image could land last. Queue, never cancel: a cancelled job can stop
+    # between `set image` and `rollout status`. Keyed per repository, deployment set and ref,
+    # so unrelated applications never wait on each other. The gw- prefix keeps this distinct
+    # from any caller-level group: a callee group equal to its caller's deadlocks.
+    concurrency:
+      group: gw-deploy-${{ github.repository }}-${{ inputs.k8s-deployment-name }}-${{ github.ref }}
+      cancel-in-progress: false
+    env:
+      LOG_FILE: /tmp/deployment_logs.txt
     steps:
       -
-        name: Write Deployment Namespaces To Local
-        run: echo '${{ inputs.branch-env-map }}' > /tmp/deployment_namespaces.json
-      -
-        name: Set Deployment Namespace
-        run: echo "DEPLOYMENT_NAMESPACE=$(jq -r '.["${{ github.ref_name }}"]' /tmp/deployment_namespaces.json)" >> $GITHUB_ENV
+        name: Resolve Deployment Namespace
+        env:
+          BRANCH_ENV_MAP: ${{ inputs.branch-env-map }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! jq -e 'type == "object"' <<<"$BRANCH_ENV_MAP" >/dev/null 2>&1; then
+            echo "::error title=Invalid branch-env-map::branch-env-map must be a JSON object mapping branch names to namespaces; got: $BRANCH_ENV_MAP"
+            exit 1
+          fi
+          namespace=$(jq -r --arg ref "$REF_NAME" '.[$ref] | select(type == "string")' <<<"$BRANCH_ENV_MAP")
+          if [ -z "$namespace" ]; then
+            echo "::error title=No namespace for branch::'$REF_NAME' is in deploy-branches but has no entry in branch-env-map. Add it to branch-env-map or remove it from deploy-branches."
+            exit 1
+          fi
+          if ! [[ "$namespace" =~ ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$ ]]; then
+            echo "::error title=Invalid namespace::'$namespace' (for branch '$REF_NAME') is not a valid Kubernetes namespace name."
+            exit 1
+          fi
+          echo "Deploying branch '$REF_NAME' to namespace '$namespace'"
+          echo "DEPLOYMENT_NAMESPACE=$namespace" >> "$GITHUB_ENV"
+        shell: bash
       - uses: azure/setup-kubectl@v5
         name: Install Kubectl
         with:
-          version: 'v1.31.0'
+          version: ${{ inputs.kubectl-version }}
         id: install-kubectl
       - uses: azure/k8s-set-context@v5
         name: Set Kubectl Context
@@ -64,68 +112,141 @@ jobs:
         id: setcontext-kubectl
       -
         name: Deploy Image to Kubernetes
+        env:
+          DEPLOYMENT_IMAGE: ${{ inputs.image-full-name }}
+          DEPLOYMENT_NAMES: ${{ inputs.k8s-deployment-name }}
+          ROLLOUT_TIMEOUT: ${{ inputs.rollout-timeout }}
         run: |
-          FAILED_DEPLOYMENTS=""
-          IFS=',' read -ra DEPLOYMENTS <<< "$DEPLOYMENT_NAMES"
-          for DEPLOY_NAME in "${DEPLOYMENTS[@]}"; do
-            DEPLOY_NAME=$(echo "$DEPLOY_NAME" | xargs)
-            [ -z "$DEPLOY_NAME" ] && continue
+          # Every kubectl call carries an explicit `|| return 1`. bash ignores `set -e` inside
+          # anything that is the operand of `if`, `!`, `&&` or `||` (subshells and functions
+          # included), so the former `if ! ( set -e; ... )` reported a failed `kubectl set
+          # image` as a success whenever the existing rollout was healthy.
+          deploy_one() {
+            local name="$1" containers replicas
+            containers=$(kubectl get deployment "$name" --namespace="$DEPLOYMENT_NAMESPACE" \
+              -o jsonpath='{.spec.template.spec.containers[*].name}') || return 1
+            if ! grep -qx -- "$name" < <(tr ' ' '\n' <<<"$containers"); then
+              echo "::error title=Container not found::deployment/$name has no container named '$name' (containers: $containers). k8s-deployment-name must equal the pod container name."
+              return 1
+            fi
 
-            echo "::group::Deploying $DEPLOY_NAME"
-            if ! (
-              set -e
-              kubectl set image "deployment/$DEPLOY_NAME" "$DEPLOY_NAME=$DEPLOYMENT_IMAGE" \
-                --namespace="$DEPLOYMENT_NAMESPACE"
+            kubectl set image "deployment/$name" "$name=$DEPLOYMENT_IMAGE" \
+              --namespace="$DEPLOYMENT_NAMESPACE" || return 1
 
-              ORIGINAL_REPLICAS=$(kubectl get deployment "$DEPLOY_NAME" \
-                --namespace="$DEPLOYMENT_NAMESPACE" \
-                -o jsonpath='{.metadata.annotations.downscaler/original-replicas}' || echo "")
-              if [ -n "$ORIGINAL_REPLICAS" ]; then
-                # In the case where a deployment wasn't scaled down YET, the scaling command is essentially a no-op but the TTL clock is reset.
-                kubectl annotate deployment "$DEPLOY_NAME" \
-                  deployment-time="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-                  --namespace="$DEPLOYMENT_NAMESPACE" --overwrite
-                kubectl scale deployment "$DEPLOY_NAME" \
-                  --replicas=$ORIGINAL_REPLICAS --namespace="$DEPLOYMENT_NAMESPACE"
-              fi
+            replicas=$(kubectl get deployment "$name" --namespace="$DEPLOYMENT_NAMESPACE" \
+              -o jsonpath='{.metadata.annotations.downscaler/original-replicas}') || return 1
+            if [ -n "$replicas" ]; then
+              # A deployment not yet scaled down makes the scale a no-op, but the TTL clock is reset.
+              kubectl annotate deployment "$name" \
+                deployment-time="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                --namespace="$DEPLOYMENT_NAMESPACE" --overwrite || return 1
+              kubectl scale deployment "$name" --replicas="$replicas" \
+                --namespace="$DEPLOYMENT_NAMESPACE" || return 1
+            fi
 
-              kubectl rollout status deployment "$DEPLOY_NAME" \
-                --namespace="$DEPLOYMENT_NAMESPACE" \
-                --timeout="$ROLLOUT_TIMEOUT"
-            ); then
-              echo "::error::Deployment of $DEPLOY_NAME failed!"
-              FAILED_DEPLOYMENTS="$FAILED_DEPLOYMENTS $DEPLOY_NAME"
+            kubectl rollout status deployment "$name" \
+              --namespace="$DEPLOYMENT_NAMESPACE" --timeout="$ROLLOUT_TIMEOUT" || return 1
+          }
+
+          failed=()
+          IFS=',' read -ra deployments <<<"$DEPLOYMENT_NAMES"
+          for raw in "${deployments[@]}"; do
+            name=$(tr -d '[:space:]' <<<"$raw")
+            [ -z "$name" ] && continue
+            echo "::group::Deploying $name"
+            if deploy_one "$name"; then
+              echo "deployment/$name now runs $DEPLOYMENT_IMAGE"
+            else
+              echo "::error title=Deploy failed::deployment/$name in namespace $DEPLOYMENT_NAMESPACE did not roll out $DEPLOYMENT_IMAGE."
+              failed+=("$name")
             fi
             echo "::endgroup::"
           done
 
-          if [ -n "$FAILED_DEPLOYMENTS" ]; then
-            echo "::error::The following deployments failed:$FAILED_DEPLOYMENTS"
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "::error title=Deploy failed::${#failed[@]} deployment(s) failed: ${failed[*]}"
             exit 1
           fi
-        env:
-          DEPLOYMENT_IMAGE: ${{ inputs.image-full-name }}
-          DEPLOYMENT_NAMES: ${{ inputs.k8s-deployment-name }}
-          DEPLOYMENT_NAMESPACE: ${{ env.DEPLOYMENT_NAMESPACE }}
-          ROLLOUT_TIMEOUT: ${{ inputs.rollout-timeout }}
+        shell: bash
       -
         name: Write deployment logs
         if: ${{ always() && inputs.collect-logs }}
-        run: |
-          sleep 60
-          IFS=',' read -ra DEPLOYMENTS <<< "$DEPLOYMENT_NAMES"
-          for DEPLOY_NAME in "${DEPLOYMENTS[@]}"; do
-            DEPLOY_NAME=$(echo "$DEPLOY_NAME" | xargs)
-            [ -z "$DEPLOY_NAME" ] && continue
-            if [ ${#DEPLOYMENTS[@]} -gt 1 ]; then
-              echo "=== Logs for deployment/$DEPLOY_NAME ===" >> /tmp/deployment_logs.txt
-            fi
-            kubectl logs "deployment/$DEPLOY_NAME" \
-              --namespace="$DEPLOYMENT_NAMESPACE" >> /tmp/deployment_logs.txt 2>&1
-          done
         env:
           DEPLOYMENT_NAMES: ${{ inputs.k8s-deployment-name }}
-          DEPLOYMENT_NAMESPACE: ${{ env.DEPLOYMENT_NAMESPACE }}
+          LOG_SETTLE_SECONDS: ${{ inputs.log-settle-seconds }}
+        run: |
+          # Never stops part-way: every kubectl call is guarded, so one unreadable pod does not
+          # cost the rest, and the file always exists for the upload. Problems are reported as
+          # a warning at the end.
+          #
+          # Layout, per deployment: a "=== Logs for deployment/<name> ===" line, then for every
+          # running pod (not terminating) and each of its containers, init containers included:
+          # a "--- pod/<pod> container <c>" line, the previous instance's log when the container
+          # has restarted, then the current log. Log lines are written verbatim (no --prefix),
+          # so check-logs exceptions anchored to the start or end of a line still apply. Text
+          # written here must not contain check-logs error words (error, fail, fatal, unable,
+          # unavailable, unrecognized, unresolved, unsuccessful, unsupported).
+          set -o pipefail
+          : > "$LOG_FILE"
+          problems=()
+
+          collect_deployment() {
+            local name="$1" selector pods pod container restarts
+            selector=$(kubectl get deployment "$name" --namespace="$DEPLOYMENT_NAMESPACE" -o json \
+              | jq -r '.spec.selector.matchLabels // {} | to_entries | map("\(.key)=\(.value)") | join(",")') \
+              || { problems+=("deployment/$name: selector not readable"); return; }
+            if [ -z "$selector" ]; then
+              problems+=("deployment/$name: no matchLabels selector")
+              return
+            fi
+            # Pods of this deployment that are not being deleted and run a container named after
+            # it. After a completed rollout those are exactly the new pods.
+            pods=$(kubectl get pods --namespace="$DEPLOYMENT_NAMESPACE" --selector="$selector" -o json \
+              | jq -r --arg name "$name" '
+                  .items[]
+                  | select(.metadata.deletionTimestamp == null)
+                  | select(any(.spec.containers[]; .name == $name))
+                  | .metadata.name as $pod
+                  | ((.status.initContainerStatuses // []) + (.status.containerStatuses // []))[]
+                  | [$pod, .name, (.restartCount // 0)] | @tsv') \
+              || { problems+=("deployment/$name: pods not readable"); return; }
+            if [ -z "$pods" ]; then
+              problems+=("deployment/$name: no running pods")
+              return
+            fi
+            while IFS=$'\t' read -r pod container restarts; do
+              echo "--- pod/$pod container $container"
+              if [ "$restarts" -gt 0 ]; then
+                echo "--- previous instance of pod/$pod container $container (restarts: $restarts)"
+                kubectl logs "pod/$pod" --container="$container" --namespace="$DEPLOYMENT_NAMESPACE" --previous \
+                  || problems+=("pod/$pod container $container: previous instance not readable")
+                echo "--- current instance of pod/$pod container $container"
+              fi
+              kubectl logs "pod/$pod" --container="$container" --namespace="$DEPLOYMENT_NAMESPACE" \
+                || problems+=("pod/$pod container $container: log not readable")
+            done <<<"$pods"
+          }
+
+          if [ "$LOG_SETTLE_SECONDS" -gt 0 ]; then
+            echo "Waiting ${LOG_SETTLE_SECONDS}s before reading logs"
+            sleep "$LOG_SETTLE_SECONDS"
+          fi
+
+          IFS=',' read -ra deployments <<<"$DEPLOYMENT_NAMES"
+          for raw in "${deployments[@]}"; do
+            name=$(tr -d '[:space:]' <<<"$raw")
+            [ -z "$name" ] && continue
+            echo "=== Logs for deployment/$name ===" >> "$LOG_FILE"
+            # A redirect rather than a pipe: the function runs in this shell, so problems+=() persists.
+            collect_deployment "$name" >> "$LOG_FILE" 2>&1
+          done
+
+          echo "Collected $(wc -l < "$LOG_FILE") line(s) into $LOG_FILE"
+          if [ "${#problems[@]}" -gt 0 ]; then
+            printf -v joined '%s; ' "${problems[@]}"
+            echo "::warning title=Incomplete deployment logs::${joined%; }"
+          fi
+        shell: bash
       -
         name: Archive Deployment Logs
         if: ${{ always() && inputs.collect-logs }}
@@ -133,4 +254,5 @@ jobs:
         with:
           name: deployment-logs
           path: /tmp/deployment_logs.txt
+          if-no-files-found: error
           retention-days: 7

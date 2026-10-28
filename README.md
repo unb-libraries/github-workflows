@@ -12,7 +12,8 @@ jobs:
 
 ## Versioning
 
-`1.x` is a **moving branch** and the default branch. 
+`1.x` is a **moving branch** and the default branch. Every caller picks up a change on its
+next run, so nothing merges without passing `ci.yaml`.
 
 ## Layout
 
@@ -22,7 +23,10 @@ jobs:
 | `.github/workflows/publish-image.yaml` | Entry point: build → push → notify (no deploy). For base and service images consumed by other repositories |
 | `.github/workflows/build-push-notify.yaml` | **Deprecated** wrapper around `publish-image.yaml`, kept for existing callers |
 | `.github/workflows/build-push.yaml` | Build and push to GHCR; emits the image tag as an output |
-| `.github/workflows/deploy.yaml` | `kubectl set image` + rollout wait, per namespace |
+| `.github/workflows/deploy.yaml` | `kubectl set image` + rollout wait, per deployment, in the branch's namespace |
+| `.github/actions/build-themes` | Builds and verifies Drupal themes with the app's own dockworker |
+| `.github/actions/check-logs` | PHP-free deployment log check |
+| `.github/workflows/ci.yaml` | This repository's own CI: actionlint, shellcheck, tests |
 | `.github/workflows/notify-start.yaml` | Slack, run start |
 | `.github/workflows/notify-conclusion.yaml` | Slack, run conclusion |
 

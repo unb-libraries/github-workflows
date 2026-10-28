@@ -37,8 +37,8 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Two rapid pushes to a deploy branch otherwise race in `kubectl set image`, and the older
-# build can land last.
+# Cancels superseded builds of the same branch or PR. Deploys are additionally queued, never
+# cancelled, inside deploy.yaml, so the older image can never land last.
 concurrency:
   group: deploy-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -71,15 +71,39 @@ line and remove the inputs below.
 
 | `dockworker@6.x` input | Here |
 |---|---|
-| `build-themes: true` | Unchanged. Now the [`build-themes` action](#build-themes); the app's own `vendor/bin/dockworker` still does the build. |
-| `php-version`, `composer-version` | **Removed.** `build-themes` uses the runner distribution's PHP and Composer. |
+| `build-themes: true` | Unchanged. Now the [`build-themes` action](#build-themes), run once per build; the app's own `vendor/bin/dockworker` still does the build. |
+| `php-version` | Unchanged (default `8.4`); used only by `build-themes`. |
+| `composer-version` | **Removed.** Composer is pinned to 2.10.2 inside `build-themes`. |
 | `run-log-check` | Replaced by `check-logs` (**defaults false**). Set `log-check-profile: drupal` to get dockworker-drupal's exceptions. The check is the PHP-free `check-logs` action, not `vendor/bin/dockworker logs:check-file`; see [Deployment log check](#deployment-log-check). |
 | `push-branches`, `push-all-branches` | **Removed.** Already declared-but-ignored in 6.x; every branch is tagged by its sanitized branch name. |
-| — | `pre-build-command` (new) |
+| — | `pre-build-command` and `pre-build-outputs` (new; see [`pre-build-command`](#pre-build-command)) |
 | — | `collect-logs` (new; was slaved to `run-log-check`, now independent and **defaults false**) |
-| — | `rollout-timeout` (new, default `10m`) |
+| — | `log-settle-seconds` (new, default `60`, the 6.x wait) |
+| — | `rollout-timeout` (new, default `10m`) and `deploy-timeout-minutes` (new, default `30`) |
+| — | `kubectl-version` (new, default `v1.31.0`) |
 | — | `distribute`, `arm64-runner`, `amd64-runner`, `compression` (same names and defaults as 6.x) |
 | — | `build-cache` (new, default true) |
+| `GH_NPM_TOKEN` secret | Unchanged: optional, exposed to the image build as the `npmrc` build secret. |
+
+### Behaviour changes from 6.x
+
+These fix defects that 6.x shares; a caller that worked on 6.x is affected only if it relied
+on one of them.
+
+- **A failed `kubectl set image` fails the deploy.** 6.x wrapped the rollout in
+  `if ! ( set -e; ... )`, where bash ignores `set -e`, so a failed `set image` (for example
+  a container not named after its deployment) was reported as success whenever the existing
+  rollout was healthy.
+- **A deploy branch missing from `branch-env-map` fails the deploy.** 6.x deployed to a
+  namespace literally named `null`.
+- **Logs come from every pod and container** of the deployment, including init containers
+  and, for a container that restarted, its previous instance. 6.x read one container of one
+  pod. See [Deployment log check](#deployment-log-check).
+- **The log check also runs after a failed deploy**, to display the logs; only a successful
+  deploy is scanned.
+- **`build-themes` verifies its output.** dockworker ignores Sass failures, so 6.x shipped
+  stale or missing CSS silently. See [`build-themes`](#build-themes).
+- **Every job has a timeout.**
 
 Workflows deliberately **not** carried over: `test-unit`, `test-e2e`, `test-api`,
 `test-logs` (replaced by the `check-logs` action), `update`, `update-docker-compose`, `install-test`, `workflow-os`,
@@ -93,7 +117,9 @@ belongs to that package's local-development surface.
 
 With `check-logs: true`, `build-push-deploy-notify.yaml` collects the post-rollout container
 logs (`collect-logs` is implied) and the `Check New Deployment Logs` job fails the run if any
-line is an error. It runs only when the deploy did, and `Notify Conclusion` waits for it.
+line is an error. It runs after a successful deploy, and after a failed one too, where it
+only displays the logs (the run is already red). It is skipped on non-deploy branches.
+`Notify Conclusion` waits for it.
 
 ```yaml
     with:
@@ -114,9 +140,29 @@ The check is `.github/actions/check-logs`, a stdlib-only Python port of dockwork
   check, unless it matches an exception pattern.
 - Exception patterns come from the profile (`rules/drupal.exceptions`; `generic` has none)
   plus `log-check-exceptions`. Add an app-specific exception there rather than to a profile.
+  Each pattern is validated on its own: an invalid one fails the check naming its source and
+  line.
 
-Run the tests with `python3 -m unittest .github/actions/check-logs/test_check_logs.py`
-from the action directory.
+The collected log (artifact `deployment-logs`, file `deployment_logs.txt`) is laid out as:
+
+```
+=== Logs for deployment/<name> ===
+--- pod/<pod> container <container>
+<log lines, verbatim>
+--- previous instance of pod/<pod> container <container> (restarts: N)   # only after a restart
+...
+```
+
+Pods being deleted are skipped, so after a completed rollout only the new pods are read.
+Previous-instance logs are scanned: a container that crashed during the deploy fails the
+check even if its replacement started. Log lines are not prefixed, so exceptions anchored to
+the start or end of a line still apply. Because the header lines carry deployment, pod and
+container names, a name containing one of the error words above would fail the check.
+
+`log-settle-seconds` (default 60) waits after the rollout before reading, so output written
+just after the pod became ready is included.
+
+Run the tests from the action directory: `python3 -m unittest -v test_check_logs.py`.
 
 ## Image tagging
 
@@ -160,29 +206,54 @@ same image name.
       build-themes: true
 ```
 
-Runs the `build-themes` action (`.github/actions/build-themes`) after checkout and before
-`pre-build-command`. It installs the runner distribution's PHP (with `ext-yaml`), Composer and
-Dart Sass 1.62.1, runs `composer install`, then runs the application's own
-`vendor/bin/dockworker theme:build-all` under a pseudo-TTY. When the repository has
-a `custom/themes` directory, the step fails if no `custom/themes/*/dist/css/*.css` exists
-afterwards. The theme build logic stays in dockworker;
-this repository only provisions the toolchain.
+Runs the `build-themes` action (`.github/actions/build-themes`) **once**, in the
+`Prepare Build` job on `ubuntu-latest`, before `pre-build-command`. Each platform build then
+unpacks the same files (see [Platform builds](#platform-builds)), so every image ships
+identical CSS. The action:
+
+1. installs PHP `php-version` (default 8.4) and Composer 2.10.2 with `shivammathur/setup-php`,
+   which also authenticates Composer's GitHub downloads with the workflow token;
+2. installs Dart Sass 1.62.1 and checks the binary runs;
+3. runs `composer install --no-scripts`, then the application's own
+   `vendor/bin/dockworker theme:build-all`;
+4. verifies the output without PHP, using dockworker-drupal's own discovery rules: each
+   directory under `custom/themes` holding a `*info.yml` is a theme, and every `*.scss` in it
+   whose name does not start with `_` must have produced a non-empty
+   `dist/css/<name>.css` **during this build** (a stale stylesheet committed to git does not
+   count). dot-directories and `dist/` are not sources.
+
+The step fails, naming each missing stylesheet, if any stylesheet was not built -- dockworker
+itself ignores Sass failures -- and also if there is nothing to build at all, which means the
+caller should not set `build-themes: true`. The theme build logic stays in dockworker; this
+repository only provisions and checks it.
+
+Only `build-push-deploy-notify.yaml` (and `build-push.yaml`) expose `build-themes`;
+`publish-image.yaml` does not, because base images have no Drupal themes.
 
 ## `pre-build-command`
 
-A general hook for any other asset build. It runs in the repository root, under `bash`,
-after checkout and before the image build:
+A general hook for any other asset build. It runs **once**, in the repository root under
+`bash`, in the `Prepare Build` job on an amd64 runner, after `build-themes`. Declare what it
+produces in `pre-build-outputs`; only those paths are carried into the platform builds:
 
 ```yaml
     with:
       pre-build-command: 'npm ci && npm run build:assets'
+      pre-build-outputs: |
+        web/dist
+        web/manifest.json
 ```
+
+`pre-build-outputs` takes newline-separated, repository-relative paths or bash globs
+(`**` included). It is required when `pre-build-command` is set, and each entry must match
+something. Because the command runs on one architecture, its outputs must be
+architecture-neutral; build native code in the Dockerfile instead.
 
 It interpolates into a `run:` block, so it is deliberately reachable only through
 `workflow_call`. **Never expose it through a `workflow_dispatch` input.**
 
-Anything it writes lands in the workspace, which is why `build-context` must never be empty
--- see below.
+The built files land in each platform job's workspace, which is why `build-context` must
+never be empty -- see below.
 
 ## Configuring the image source
 
@@ -231,8 +302,9 @@ but they do consume that repository's 10GB Actions cache budget, and `cache-to` 
 `mode=max` (every intermediate layer, not just the final ones). Set `build-cache: false` to
 opt a repository out.
 
-Each platform job writes its own cache scope (`buildkit-linux-amd64`,
-`buildkit-linux-arm64-v8`), so the parallel jobs below never overwrite each other's cache.
+Each image and platform has its own cache scope (`<image-name>-<platform>`, sanitized), so
+parallel platform jobs, and two images built from one repository, never overwrite each
+other's cache.
 
 A cache only helps if the Dockerfile is layered so that expensive steps precede the
 frequently-changing `COPY`. A Dockerfile that copies the whole repository before installing
@@ -247,7 +319,14 @@ else on `amd64-runner` (default `ubuntu-latest`) -- pushes each by digest, and a
 and pushes its tags directly. `distribute: false` builds every platform in one job, emulating
 non-amd64 platforms under QEMU. At most four platforms can be distributed.
 
-`build-themes` and `pre-build-command` run once in **each** platform job, on that job's runner.
+`build-themes` and `pre-build-command` run once, in `Prepare Build`, which packs their
+output into the `build-push-assets` artifact (kept 3 days; internal, not a consumer contract).
+Each platform job unpacks it into its workspace before building. If a re-run fails because
+that artifact expired, re-run all jobs.
+
+Job timeouts: `Prepare Build` 20 minutes; `Build Image` 90 minutes, or 360 when
+`distribute: false` emulates platforms; `Merge Platform Images` 10; the deploy
+`deploy-timeout-minutes` (default 30); the log check 10; pruning 30; notifications 5.
 
 Layers are pushed with `compression: zstd` by default (OCI media types), which needs
 containerd 1.5+ / Docker 23+ wherever the image is pulled. Set `compression: gzip` for older
@@ -262,8 +341,8 @@ The build job's check name includes its platform, e.g. `Build Image (linux/amd64
 The pipeline assumes exactly one image per repository per run. The scalar `dockerfile` /
 `build-context` inputs are shaped to become per-entry keys of a future JSON `images` input
 (`[{key, image-name, dockerfile, build-context}]`), where today's scalars normalize into a
-one-element list and `build-image` becomes a `strategy.matrix`. These are the couplings that
-must be resolved first:
+one-element list and the existing per-platform `build-image` matrix gains an image
+dimension. These are the couplings that must be resolved first:
 
 1. **`deploy.yaml` maps one image onto N deployments.** `image-full-name` is invariant across
    the `k8s-deployment-name` CSV, and the `kubectl set image` call assumes the pod container
@@ -281,11 +360,10 @@ must be resolved first:
 publishes keyed outputs, while the primary leg *also* publishes today's scalars, so existing
 callers keep working while multi-image callers opt in.
 
-**Watch status-check names.** Converting `build-image` to a matrix renames the leaf check
-from `Build Image` to `Build Image (…)`, which would strand any required status check
-configured on a consumer's branch protection. Re-check with
-`gh api repos/unb-libraries/<repo>/rulesets` across the fleet immediately before that
-migration.
+**Watch status-check names.** The leaf check is already `Build Image (<platform>)`; adding an
+image dimension would rename it again, stranding any required status check configured on a
+consumer's branch protection. Re-check with `gh api repos/unb-libraries/<repo>/rulesets`
+across the fleet immediately before that migration.
 
 **Related lever, deliberately deferred:** a `target` input (multi-stage `--target`) would let
 a single Dockerfile yield several images without N Dockerfiles. Revisit alongside `images`.

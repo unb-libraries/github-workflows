@@ -10,7 +10,12 @@ on:
         required: true
         type: string
       pre-build-command:
-        description: 'Optional shell command run in the repository root before the image build. See build-push.yaml.'
+        description: 'Optional shell command run once in the repository root before the image build. Requires pre-build-outputs. See build-push.yaml.'
+        required: false
+        type: string
+        default: ''
+      pre-build-outputs:
+        description: 'Newline-separated repository-relative paths or globs that pre-build-command produces. See build-push.yaml.'
         required: false
         type: string
         default: ''
@@ -78,14 +83,17 @@ on:
         required: true
       GH_CONTAINER_REGISTRY_TOKEN:
         required: true
-
+      GH_NPM_TOKEN:
+        description: 'Optional token for the GitHub npm registry, exposed to the image build as the npmrc build secret.'
+        required: false
 
 jobs:
   publish:
-    uses: unb-libraries/github-workflows/.github/workflows/publish-image.yaml@1.x
+    uses: unb-libraries/github-workflows/.github/workflows/publish-image.yaml@harden
     with:
       image-name: ${{ inputs.image-name }}
       pre-build-command: ${{ inputs.pre-build-command }}
+      pre-build-outputs: ${{ inputs.pre-build-outputs }}
       platforms: ${{ inputs.platforms }}
       build-cache: ${{ inputs.build-cache }}
       docker-build-record-retention-days: ${{ inputs.docker-build-record-retention-days }}
@@ -100,3 +108,4 @@ jobs:
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
       GH_CONTAINER_REGISTRY_USER: ${{ secrets.GH_CONTAINER_REGISTRY_USER }}
       GH_CONTAINER_REGISTRY_TOKEN: ${{ secrets.GH_CONTAINER_REGISTRY_TOKEN }}
+      GH_NPM_TOKEN: ${{ secrets.GH_NPM_TOKEN }}

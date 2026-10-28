@@ -4,10 +4,15 @@
 The fixtures are verbatim docker-compose captures from real Drush runs, ported from
 dockworker's test/log_classifier_test.php, including the "<slug>  | " prefix.
 
-Run: python3 -m unittest .github/actions/check-logs/test_check_logs.py
+Run from this directory: python3 -m unittest -v test_check_logs.py
 """
 
+import contextlib
+import io
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
 import check_logs
 
@@ -126,6 +131,52 @@ class GenericProfileTest(unittest.TestCase):
         errors, exceptions = check_logs.load_patterns("generic", "known noise\n\nother noise\n")
         error_lines, _ = check_logs.check("known noise: failed\nreal failure", errors, exceptions)
         self.assertEqual(error_lines, ["real failure"])
+
+
+class PatternTest(unittest.TestCase):
+    def test_invalid_extra_exception_is_reported_with_line(self):
+        with self.assertRaises(check_logs.PatternError) as ctx:
+            check_logs.load_patterns("generic", "fine\nbad(")
+        self.assertIn("extra-exceptions line 2", str(ctx.exception))
+        self.assertIn("'bad('", str(ctx.exception))
+
+    def test_invalid_rules_file_is_reported_with_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "core.errors").write_text("# comment\nfine\nbroken[\n", encoding="utf-8")
+            with mock.patch.object(check_logs, "RULES_DIR", Path(tmp)):
+                with self.assertRaises(check_logs.PatternError) as ctx:
+                    check_logs.load_patterns("generic")
+        self.assertIn("rules/core.errors line 3", str(ctx.exception))
+
+    def test_empty_pattern_rejected(self):
+        with self.assertRaises(check_logs.PatternError):
+            check_logs.compile_alternation([(1, "  ")], "test")
+
+    def test_each_pattern_is_grouped(self):
+        # A stray top-level '|' stays inside its own group instead of matching everything.
+        compiled = check_logs.compile_alternation([(1, "a"), (2, "b|")], "test")
+        self.assertEqual(compiled.pattern, "(?:a)|(?:b|)")
+        _, exceptions = check_logs.load_patterns("generic", "known noise")
+        self.assertIsNone(exceptions.search("PHP Fatal error: boom"))
+
+    def test_no_patterns_compiles_to_none(self):
+        self.assertIsNone(check_logs.compile_alternation([], "test"))
+
+    def test_well_known_matches_a_literal_dot_only(self):
+        errors, exceptions = check_logs.load_patterns("drupal")
+        error_lines, _ = check_logs.check(
+            "GET /.well-known/acme-challenge failed\nGET /xwell-known failed", errors, exceptions)
+        self.assertEqual(error_lines, ["GET /xwell-known failed"])
+
+    def test_main_reports_invalid_pattern(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".txt") as log:
+            log.write("all good\n")
+            log.flush()
+            argv = ["check_logs.py", log.name, "--extra-exceptions", "bad("]
+            out = io.StringIO()
+            with mock.patch("sys.argv", argv), contextlib.redirect_stdout(out):
+                self.assertEqual(check_logs.main(), 1)
+        self.assertIn("::error title=Invalid pattern::extra-exceptions line 1", out.getvalue())
 
 
 if __name__ == "__main__":

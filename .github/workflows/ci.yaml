@@ -1,0 +1,44 @@
+name: CI
+
+# Unlike the other files here, this is not a reusable workflow: it tests this repository.
+# 1.x is a moving branch that every caller picks up on its next run, so nothing merges
+# without passing this.
+on:
+  pull_request:
+  push:
+    branches: [ 1.x ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    name: Lint Workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      -
+        # The image bundles shellcheck, which actionlint runs on every run: block.
+        name: actionlint
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
+      -
+        name: shellcheck
+        run: >-
+          docker run --rm -v "$PWD:/repo" -w /repo --entrypoint shellcheck rhysd/actionlint:1.7.12
+          .github/actions/build-themes/*.sh tests/*.sh
+
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      -
+        name: check-logs
+        working-directory: .github/actions/check-logs
+        run: python3 -m unittest -v test_check_logs.py
+      -
+        name: verify-themes
+        run: bash tests/verify-themes.sh
