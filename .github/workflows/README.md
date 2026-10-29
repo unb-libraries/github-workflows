@@ -177,6 +177,15 @@ in the pull request description. `update-nuxt.yaml` runs `pnpm update` (`latest:
 `--latest`); `update-ckeditor5.yaml` pins each module's `ckeditor5` to the range the site's
 Drupal core ships and rebuilds the plugins.
 
+Nuxt applications update monthly, on the 1st, rather than twice weekly:
+
+```yaml
+on:
+  schedule:
+    - cron: '25 5 1 * *'
+  workflow_dispatch:
+```
+
 ## Deployment log check
 
 With `check-logs: true`, `build-push-deploy-notify.yaml` collects the post-rollout container
