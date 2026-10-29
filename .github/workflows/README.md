@@ -20,6 +20,7 @@ runs the application's own dockworker.
 | `build-push-notify.yaml` | **Deprecated** (remove in 2.x): wraps `publish-image.yaml` unchanged. Repoint `uses:` to `publish-image.yaml`; inputs and secrets are identical. |
 | `build-push-deploy-notify.yaml` | Build/push, deploy to Kubernetes, prune, notify. The common case. |
 | `update.yaml` | Scheduled composer updates, opened as a pull request. See [Updaters](#updaters). |
+| `update-php.yaml` | Scheduled composer updates for PHP applications that aren't built into an image, opened as a pull request. |
 | `update-nuxt.yaml` | Scheduled pnpm updates for Nuxt applications, opened as a pull request. |
 | `update-ckeditor5.yaml` | Scheduled updates of a Drupal site's CKEditor 5 plugin modules, opened as a pull request. |
 
@@ -116,7 +117,7 @@ and `build-push-test-deploy-notify` (zero consumers, and its `needs:` chain is b
 
 ## Updaters
 
-The three updaters are called from a scheduled workflow in each application and open (or
+The updaters are called from a scheduled workflow in each application and open (or
 refresh) one pull request with the changes; nothing is pushed to a deploy branch directly.
 Each takes `pr-branch` (the pull request's branch), `git-author` and `git-committer`, and the
 `PAT_TOKEN` secret, as in dockworker 6.x.
@@ -169,6 +170,25 @@ Differences from dockworker 6.x:
   ran. A PHP 8.2 site therefore failed every update (lib.unb.ca, since at least 2026-10-08),
   or worse, could be offered packages its runtime cannot load.
 - `add-paths` is optional; the derived paths are the same as 6.x's.
+
+### `update-php.yaml`
+
+For PHP applications that are not built into an image (command-line tools run directly on a
+host), so `update.yaml` has no base image to resolve in. Installs `php-version` (default `8.4`;
+match the version the application runs) on the runner and runs the same
+`composer update --no-install --no-scripts --no-plugins --ignore-platform-req=ext-*` in `dir`
+(default the repository root). It needs no `.dockworker/dockworker.yml`. The pull request stages
+`composer.json` and `composer.lock`, and its description matches `update.yaml`'s.
+
+```yaml
+jobs:
+  update:
+    uses: unb-libraries/github-workflows/.github/workflows/update-php.yaml@1.x
+    with:
+      php-version: '8.4'
+    secrets:
+      PAT_TOKEN: ${{ secrets.UNBLIBBOT_PAT_TOKEN }}
+```
 
 ### `update-nuxt.yaml` and `update-ckeditor5.yaml`
 
