@@ -50,10 +50,10 @@ on:
         type: number
         default: 30
       kubectl-version:
-        description: 'kubectl release to install. Keep it within one minor version of the cluster API server. Default v1.31.0.'
+        description: 'kubectl release to install. Keep it within one minor version of the cluster API server. Default v1.37.2.'
         required: false
         type: string
-        default: 'v1.31.0'
+        default: 'v1.37.2'
     secrets:
       KUBE_CONFIG:
         required: true

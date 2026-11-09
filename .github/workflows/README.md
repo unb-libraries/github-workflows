@@ -84,7 +84,7 @@ line and remove the inputs below.
 | — | `collect-logs` (new; was slaved to `run-log-check`, now independent and **defaults false**) |
 | — | `log-settle-seconds` (new, default `60`, the 6.x wait) |
 | — | `rollout-timeout` (new, default `10m`) and `deploy-timeout-minutes` (new, default `30`) |
-| — | `kubectl-version` (new, default `v1.31.0`) |
+| — | `kubectl-version` (new, default `v1.37.2`) |
 | — | `distribute`, `arm64-runner`, `amd64-runner`, `compression` (same names and defaults as 6.x) |
 | — | `build-cache` (new, default true) |
 | `GH_NPM_TOKEN` secret | Unchanged: optional, exposed to the image build as the `npmrc` build secret. |
