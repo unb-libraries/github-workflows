@@ -131,7 +131,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$OUTCOME" = success ]; then result='passed'; else result='**failed**'; fi
-          printf '\n`composer check` %s on the updated dependencies ([workflow run](%s)).\n' \
+          printf "\n\`composer check\` %s on the updated dependencies ([workflow run](%s)).\n" \
             "$result" "$RUN_URL" >> "$RUNNER_TEMP/body.md"
 
       - name: Create Pull Request
