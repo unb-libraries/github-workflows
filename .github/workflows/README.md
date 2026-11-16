@@ -180,6 +180,12 @@ match the version the application runs) on the runner and runs the same
 (default the repository root). It needs no `.dockworker/dockworker.yml`. The pull request stages
 `composer.json` and `composer.lock`, and its description matches `update.yaml`'s.
 
+The runner gets the `ext-*` extensions listed in the application's `require` and `require-dev`.
+If `composer.json` defines a `check` script, the workflow then installs the updated lock (dev
+dependencies included) and runs `composer check`. The pull request is opened either way, with
+the result in its description, and a failed check fails the run. Applications without a `check`
+script are updated as before, unchecked.
+
 ```yaml
 jobs:
   update:

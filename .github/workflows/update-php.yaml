@@ -42,9 +42,26 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
+
+      - name: Read Application Requirements
+        id: app
+        working-directory: ${{ inputs.dir }}
+        run: |
+          set -euo pipefail
+          # The PHP extensions the application requires, so composer check runs against them.
+          extensions=$(jq -r '[(.require // {}), (."require-dev" // {}) | keys[]
+            | select(startswith("ext-")) | ltrimstr("ext-")] | unique | join(", ")' composer.json)
+          # Only applications that define a "check" composer script are checked.
+          if jq -e '.scripts.check' composer.json > /dev/null; then check=true; else check=false; fi
+          {
+            echo "extensions=$extensions"
+            echo "check=$check"
+          } >> "$GITHUB_OUTPUT"
+
       - uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ inputs.php-version }}
+          extensions: ${{ steps.app.outputs.extensions }}
           tools: composer
           coverage: none
 
@@ -89,6 +106,34 @@ jobs:
           } > "$RUNNER_TEMP/body.md"
           cat "$RUNNER_TEMP/body.md"
 
+      - name: Check Updated Application
+        id: check
+        if: steps.app.outputs.check == 'true'
+        # A failed check still opens the pull request, marked failed, and fails the run afterwards.
+        continue-on-error: true
+        working-directory: ${{ inputs.dir }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          COMPOSER_AUTH=$(jq -cn --arg token "$GITHUB_TOKEN" '{"github-oauth": {"github.com": $token}}')
+          export COMPOSER_AUTH
+          # Installs the updated lock, dev dependencies included; the pull request stages only
+          # composer.json and composer.lock, so vendor/ never reaches it.
+          composer install --no-interaction --no-progress
+          composer check --no-interaction
+
+      - name: Record Check Result
+        if: steps.app.outputs.check == 'true'
+        env:
+          OUTCOME: ${{ steps.check.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ "$OUTCOME" = success ]; then result='passed'; else result='**failed**'; fi
+          printf '\n`composer check` %s on the updated dependencies ([workflow run](%s)).\n' \
+            "$result" "$RUN_URL" >> "$RUNNER_TEMP/body.md"
+
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@v8
         with:
@@ -108,3 +153,9 @@ jobs:
             automated
             updates
           draft: false
+
+      - name: Fail On Check Failure
+        if: steps.check.outcome == 'failure'
+        run: |
+          echo "::error::composer check failed on the updated dependencies; see the Check Updated Application step."
+          exit 1
