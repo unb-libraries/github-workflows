@@ -45,7 +45,7 @@ on:
         type: string
         default: linux/amd64,linux/arm64/v8
       build-cache:
-        description: 'Read and write a BuildKit layer cache stored as <image-name>:buildcache-<branch>-<platform> in the registry. Default true.'
+        description: 'Read and write a BuildKit layer cache stored as <image-name>:buildcache-<branch>-<platform> in the registry. Manual and scheduled runs read none, so they rebuild every layer with current packages. Default true.'
         required: false
         type: boolean
         default: true

@@ -407,9 +407,15 @@ at the build step; do not remove that guard.
 `…/lib.unb.ca:buildcache-dev-linux-amd64`). `cache-to` uses `mode=max`, so the intermediate
 stages of a multi-stage build are cached too.
 
-- A push or manual run reads its branch's cache, then the **default branch's**, and writes
-  only its own branch's. So `prod`, or a long-lived feature branch whose `build/` differs
-  from `dev`'s, never overwrites `dev`'s cache, and a new branch starts from `dev`'s layers.
+- A push reads its branch's cache, then the **default branch's**, and writes only its own
+  branch's. So `prod`, or a long-lived feature branch whose `build/` differs from `dev`'s,
+  never overwrites `dev`'s cache, and a new branch starts from `dev`'s layers.
+- A manual (`workflow_dispatch`) or scheduled run reads **no** cache and writes its branch's.
+  It rebuilds every layer, so `apk add` installs the packages' current versions even when the
+  parent image has not changed; from a cache, that layer would keep the versions of the build
+  that wrote it. This is what a rebuild for a security fix needs (`image-mgr rebuild` and
+  `image-mgr cascade` in kubernetes-metadata dispatch these), at the cost of the cached steps'
+  time.
 - A pull request reads its base branch's cache, then the default branch's, and never writes.
 - Tag names are sanitized like the branch tag and capped at 128 characters.
 

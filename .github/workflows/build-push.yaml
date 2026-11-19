@@ -44,10 +44,11 @@ on:
       build-cache:
         description: >-
           Read and write a BuildKit layer cache, stored in the registry as
-          <image-name>:buildcache-<branch>-<platform>. Each branch reads its own cache, then
-          the default branch's; pushes and manual runs write their branch's; pull requests only
-          read their base branch's. Its final layers are the image's own, so it adds little
-          storage. Default true.
+          <image-name>:buildcache-<branch>-<platform>. Pushes read their branch's cache, then
+          the default branch's, and write their branch's; manual and scheduled runs read none,
+          so every layer is rebuilt with current packages, and write their branch's; pull
+          requests only read their base branch's. Its final layers are the image's own, so it
+          adds little storage. Default true.
         required: false
         type: boolean
         default: true
@@ -452,7 +453,10 @@ jobs:
           # layers are the image's own blobs, so the export dedupes against the push. Each branch
           # reads its own cache, then the default branch's, so a new branch (or prod) starts from
           # dev's layers; branches never overwrite each other's cache. Pull requests read their
-          # base branch's cache and never write. (Measured on hit.lib.unb.ca, the type=gha cache
+          # base branch's cache and never write. A manual or scheduled run reads none: it is how
+          # an image is rebuilt to pick up packages fixed since, and a cached `apk add` layer
+          # would keep the old ones whenever the parent image has not changed. It still writes
+          # its branch's cache for the next push. (Measured on hit.lib.unb.ca, the type=gha cache
           # was slower than no cache in every scenario: see README, Build cache.)
           cache_ref() {
             # A valid tag: sanitized like the branch tag, at most 128 characters.
@@ -464,16 +468,19 @@ jobs:
           cache_to=""
           if [ "$BUILD_CACHE" = "true" ]; then
             case "$EVENT_NAME" in
-              pull_request|pull_request_target) branch="$BASE_REF"; writes=false ;;
-              *) branch="$REF_NAME"; writes=true ;;
+              pull_request|pull_request_target) branch="$BASE_REF"; reads=true; writes=false ;;
+              workflow_dispatch|schedule) branch="$REF_NAME"; reads=false; writes=true ;;
+              *) branch="$REF_NAME"; reads=true; writes=true ;;
             esac
             if [ -n "$branch" ]; then
-              cache_from="type=registry,ref=$(cache_ref "$branch")"
+              if [ "$reads" = "true" ]; then
+                cache_from="type=registry,ref=$(cache_ref "$branch")"
+              fi
               if [ "$writes" = "true" ]; then
                 cache_to="type=registry,ref=$(cache_ref "$branch"),mode=max,image-manifest=true,oci-mediatypes=true,compression=$COMPRESSION"
               fi
             fi
-            if [ -n "$DEFAULT_BRANCH" ] && [ "$DEFAULT_BRANCH" != "$branch" ]; then
+            if [ "$reads" = "true" ] && [ -n "$DEFAULT_BRANCH" ] && [ "$DEFAULT_BRANCH" != "$branch" ]; then
               cache_from="${cache_from:+$cache_from$'\n'}type=registry,ref=$(cache_ref "$DEFAULT_BRANCH")"
             fi
             echo "Cache sources:"
