@@ -157,6 +157,10 @@ version is checked strictly, extension requirements are not (the application's D
 installs its extensions). Inline `command`, `lockfile`, `manifest` and `commit_paths` keys on a
 target override the type's preset, and also run in that image.
 
+The local `dockworker update` command (dockworker-application, `UpdateCommands`) resolves the
+same way: same targets, same image rule, same composer command. Given the same commit and image
+it writes a byte-identical lock. Keep the two presets in sync.
+
 The pull request stages each target's `composer.json` and `composer.lock` (or its
 `commit_paths`; `add-paths` overrides all of them). Its description names the image and PHP
 version, lists changed direct dependencies (a `dev-*` branch shows its commit), and counts the

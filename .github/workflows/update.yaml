@@ -75,6 +75,8 @@ jobs:
           raw=$(yq -o=json '.dockworker.update.targets // []' "$config")
           # Composer resolves against the image's PHP version, strictly; extension requirements
           # are ignored because the application's own Dockerfile installs its extensions.
+          # Keep this preset and the image rule below in sync with the local `dockworker update`
+          # (unb-libraries/dockworker-application, UpdateCommands::UPDATE_PRESETS).
           targets=$(jq -c '
             def preset: {
               composer: {
