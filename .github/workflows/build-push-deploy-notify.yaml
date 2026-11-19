@@ -25,10 +25,10 @@ on:
         type: boolean
         default: false
       php-version:
-        description: 'PHP version installed for build-themes. Default 8.4.'
+        description: 'PHP version installed for build-themes. Default 8.5.'
         required: false
         type: string
-        default: '8.4'
+        default: '8.5'
       pre-build-command:
         description: 'Optional shell command run once in the repository root before the image build. Requires pre-build-outputs. See build-push.yaml.'
         required: false

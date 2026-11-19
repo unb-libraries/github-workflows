@@ -76,7 +76,7 @@ line and remove the inputs below.
 | `dockworker@6.x` input | Here |
 |---|---|
 | `build-themes: true` | Unchanged. Now the [`build-themes` action](#build-themes), run once per build; the app's own `vendor/bin/dockworker` still does the build. |
-| `php-version` | Unchanged (default `8.4`); used only by `build-themes`. |
+| `php-version` | Kept, used only by `build-themes`. Defaults to `8.5` (6.x: `8.4`). |
 | `composer-version` | **Removed.** Composer is pinned to 2.10.2 inside `build-themes`. |
 | `run-log-check` | Replaced by `check-logs` (**defaults false**). Set `log-check-profile: drupal` to get dockworker-drupal's exceptions. The check is the PHP-free `check-logs` action, not `vendor/bin/dockworker logs:check-file`; see [Deployment log check](#deployment-log-check). |
 | `push-branches`, `push-all-branches` | **Removed.** Already declared-but-ignored in 6.x; every branch is tagged by its sanitized branch name. |
@@ -178,7 +178,7 @@ Differences from dockworker 6.x:
 ### `update-php.yaml`
 
 For PHP applications that are not built into an image (command-line tools run directly on a
-host), so `update.yaml` has no base image to resolve in. Installs `php-version` (default `8.4`;
+host), so `update.yaml` has no base image to resolve in. Installs `php-version` (default `8.5`;
 match the version the application runs) on the runner and runs the same
 `composer update --no-install --no-scripts --no-plugins --ignore-platform-req=ext-*` in `dir`
 (default the repository root). It needs no `.dockworker/dockworker.yml`. The pull request stages
@@ -195,7 +195,7 @@ jobs:
   update:
     uses: unb-libraries/github-workflows/.github/workflows/update-php.yaml@1.x
     with:
-      php-version: '8.4'
+      php-version: '8.5'
     secrets:
       PAT_TOKEN: ${{ secrets.UNBLIBBOT_PAT_TOKEN }}
 ```
@@ -314,7 +314,7 @@ Runs the `build-themes` action (`.github/actions/build-themes`) **once**, in the
 unpacks the same files (see [Platform builds](#platform-builds)), so every image ships
 identical CSS. The action:
 
-1. installs PHP `php-version` (default 8.4) and Composer 2.10.2 with `shivammathur/setup-php`,
+1. installs PHP `php-version` (default 8.5) and Composer 2.10.2 with `shivammathur/setup-php`,
    which also authenticates Composer's GitHub downloads with the workflow token;
 2. installs Dart Sass 1.62.1 and checks the binary runs;
 3. runs `composer install --no-scripts`, then the application's own

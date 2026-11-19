@@ -7,7 +7,7 @@ on:
         description: 'PHP version composer resolves dependencies against. Match the version the application runs.'
         required: false
         type: string
-        default: '8.4'
+        default: '8.5'
       dir:
         description: 'Directory holding composer.json and composer.lock, relative to the repository root. Default the root.'
         required: false

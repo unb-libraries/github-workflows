@@ -6,9 +6,9 @@ description: >-
 
 inputs:
   php-version:
-    description: 'PHP version installed with shivammathur/setup-php. Default 8.4.'
+    description: 'PHP version installed with shivammathur/setup-php. Default 8.5.'
     required: false
-    default: '8.4'
+    default: '8.5'
   composer-version:
     description: 'Composer version installed with setup-php. Default 2.10.2.'
     required: false
