@@ -196,6 +196,10 @@ jobs:
             # npm ls exits non-zero on peer dependency complaints and still prints the tree.
             { npm ls --json --depth=0 || true; } | node "$RUNNER_TEMP/snapshot.js" > "$RUNNER_TEMP/before.json"
             npm update --ignore-scripts
+            # npm update can leave nested entries that npm ci rejects; a lockfile-only
+            # install rewrites them, and the clean install proves the result installs.
+            npm install --package-lock-only --ignore-scripts
+            npm ci --ignore-scripts
             { npm ls --json --depth=0 || true; } | node "$RUNNER_TEMP/snapshot.js" > "$RUNNER_TEMP/after.json"
             npm audit --json > "$RUNNER_TEMP/audit.json" || true
           fi
