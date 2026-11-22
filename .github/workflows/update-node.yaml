@@ -1,0 +1,236 @@
+name: Update Node Application and Dependencies
+
+on:
+  workflow_call:
+    inputs:
+      latest:
+        description: 'Update to the latest versions, ignoring the ranges in package.json (pnpm update --latest). Defaults to staying within the declared ranges. pnpm only.'
+        required: false
+        type: boolean
+        default: false
+      node-version:
+        description: 'Node.js version used to run the package manager.'
+        required: false
+        type: string
+        default: '24'
+      pnpm-version:
+        description: 'pnpm version to install. Leave empty when package.json sets packageManager.'
+        required: false
+        type: string
+        default: ''
+      working-directory:
+        description: 'Directory holding package.json and its lockfile, relative to the repository root. The lockfile there selects the package manager: pnpm-lock.yaml or package-lock.json.'
+        required: false
+        type: string
+        default: '.'
+      pr-branch:
+        description: 'Branch the pull request is opened from. Default application-updates.'
+        required: false
+        type: string
+        default: 'application-updates'
+      git-author:
+        description: 'Author identity ("Name <email>") for the update PR commit.'
+        required: false
+        type: string
+        default: 'UNB Libraries CodeBot <libsystems@unb.ca>'
+      git-committer:
+        description: 'Committer identity ("Name <email>") for the update PR commit.'
+        required: false
+        type: string
+        default: 'UNB Libraries CodeBot <libsystems@unb.ca>'
+    secrets:
+      PAT_TOKEN:
+        description: 'The token to use for creating the pull request'
+        required: true
+      NPM_AUTH_TOKEN:
+        description: 'Token with read:packages, for repositories that install @unb-libraries packages from npm.pkg.github.com.'
+        required: false
+
+jobs:
+  update-application:
+    name: Update Application and Dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      HUSKY: 0
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Detect the package manager
+        id: detect
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            echo 'manager=pnpm' >> "$GITHUB_OUTPUT"
+          elif [ -f package-lock.json ]; then
+            echo 'manager=npm' >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::No pnpm-lock.yaml or package-lock.json in $PWD"
+            exit 1
+          fi
+
+      # With no version input, installs the pnpm version pinned by packageManager in package.json.
+      - uses: pnpm/action-setup@v4
+        if: steps.detect.outputs.manager == 'pnpm'
+        with:
+          version: ${{ inputs.pnpm-version }}
+          package_json_file: ${{ inputs.working-directory }}/package.json
+
+      - name: Authenticate to GitHub Packages
+        env:
+          NPM_AUTH_TOKEN: ${{ secrets.NPM_AUTH_TOKEN }}
+        run: |
+          # Written to the runner's home so the token stays out of the repository.
+          if [ -n "$NPM_AUTH_TOKEN" ]; then
+            echo "//npm.pkg.github.com/:_authToken=${NPM_AUTH_TOKEN}" >> "$HOME/.npmrc"
+          fi
+
+      - name: Update Application and Dependencies
+        id: update
+        env:
+          LATEST: ${{ inputs.latest }}
+          MANAGER: ${{ steps.detect.outputs.manager }}
+        run: |
+          # Reads `pnpm list --json` (one project, or one per workspace package) or `npm ls --json`.
+          cat > "$RUNNER_TEMP/snapshot.js" <<'EOF'
+          const input = JSON.parse(require('fs').readFileSync(0));
+          const projects = Array.isArray(input) ? input : [input];
+          const versions = {};
+          for (const project of projects) {
+            const deps = { ...project.dependencies, ...project.devDependencies };
+            for (const [name, dep] of Object.entries(deps)) {
+              // Workspace siblings and linked directories have no registry version;
+              // npm marks packages outside package.json as extraneous.
+              if (!dep.version || dep.extraneous || /^(link|file|workspace):/.test(dep.version)) continue;
+              versions[projects.length > 1 ? `${name} (${project.name})` : name] = dep.version;
+            }
+          }
+          console.log(JSON.stringify(versions));
+          EOF
+          # Reads `pnpm audit --json` (advisories) or `npm audit --json` (vulnerabilities).
+          cat > "$RUNNER_TEMP/audit.js" <<'EOF'
+          let report = {};
+          try {
+            report = JSON.parse(require('fs').readFileSync(process.argv[2]));
+          } catch {}
+          const link = (url) => `[${url.split('/').pop()}](${url})`;
+          let header;
+          let found;
+          if (report.advisories) {
+            header = '| Severity | Package | Installed | Patched in | Required by | Advisory |\n|---|---|---|---|---|---|';
+            found = Object.values(report.advisories).map((a) => {
+              const installed = [...new Set(a.findings.map((f) => f.version))].join(', ');
+              const path = a.findings[0].paths[0].replace(/^\.>/, '').replaceAll('>', ' > ');
+              return [a.severity, a.module_name, installed, `\`${a.patched_versions}\``, path, link(a.url)];
+            });
+          } else if (report.vulnerabilities) {
+            header = '| Severity | Package | Vulnerable range | Installed at | Advisory |\n|---|---|---|---|---|';
+            // An object in `via` is an advisory; a string is a dependent of an affected package.
+            found = Object.values(report.vulnerabilities).flatMap((v) => v.via
+              .filter((a) => typeof a === 'object')
+              .map((a) => [a.severity, a.name, `\`${a.range}\``, v.nodes[0], link(a.url)]));
+          } else {
+            console.log('The audit returned no report.');
+            process.exit(0);
+          }
+          const rank = ['critical', 'high', 'moderate', 'low', 'info'];
+          const rows = found
+            .sort((a, b) => rank.indexOf(a[0]) - rank.indexOf(b[0]) || a[1].localeCompare(b[1]))
+            .map((cells) => `| ${cells.join(' | ')} |`);
+          console.log(rows.length
+            ? `Advisories still open after this update: ${rows.length}. Each needs an override or a release of the package that depends on it.\n\n${header}\n${rows.join('\n')}`
+            : 'The audit reports no open advisories after this update.');
+          EOF
+          cat > "$RUNNER_TEMP/compare.js" <<'EOF'
+          const [before, after] = process.argv.slice(2).map((f) => require(f));
+          const rows = Object.keys({ ...before, ...after }).sort()
+            .filter((n) => before[n] !== after[n])
+            .map((n) => `| ${n} | ${before[n] ?? '-'} | ${after[n] ?? '-'} |`);
+          console.log(rows.length
+            ? `| Package | From | To |\n|---|---|---|\n${rows.join('\n')}`
+            : 'No direct dependency changes.');
+          EOF
+
+          # Scripts (nuxt prepare, husky) aren't needed to resolve dependencies.
+          if [ "$MANAGER" = "pnpm" ]; then
+            lockfile=pnpm-lock.yaml
+            # A workspace updates every package it lists.
+            recursive=""
+            if grep -qs '^packages:' pnpm-workspace.yaml; then
+              recursive="-r"
+            fi
+            # The name@version keys of the lockfile's packages: section.
+            lock_packages() {
+              awk '/^packages:/ { p = 1; next } /^[^ ]/ { p = 0 } p && /^  [^ ]/' | sort
+            }
+
+            pnpm install --frozen-lockfile --ignore-scripts
+            pnpm list $recursive --json --depth 0 | node "$RUNNER_TEMP/snapshot.js" > "$RUNNER_TEMP/before.json"
+            if [ "$LATEST" = "true" ]; then
+              pnpm update $recursive --latest --ignore-scripts
+            else
+              pnpm update $recursive --ignore-scripts
+            fi
+            pnpm list $recursive --json --depth 0 | node "$RUNNER_TEMP/snapshot.js" > "$RUNNER_TEMP/after.json"
+            # The audit exits non-zero whenever it finds an advisory.
+            pnpm audit --json > "$RUNNER_TEMP/audit.json" || true
+          else
+            lockfile=package-lock.json
+            if [ "$LATEST" = "true" ]; then
+              echo "::error::The latest input needs pnpm; npm update stays within the package.json ranges."
+              exit 1
+            fi
+            # The path@version of every entry in the lockfile's packages map.
+            lock_packages() {
+              node -e 'const lock = JSON.parse(require("fs").readFileSync(0)); for (const [path, pkg] of Object.entries(lock.packages ?? {})) if (path) console.log(`${path}@${pkg.version}`);' | sort
+            }
+
+            npm ci --ignore-scripts
+            # npm ls exits non-zero on peer dependency complaints and still prints the tree.
+            { npm ls --json --depth=0 || true; } | node "$RUNNER_TEMP/snapshot.js" > "$RUNNER_TEMP/before.json"
+            npm update --ignore-scripts
+            { npm ls --json --depth=0 || true; } | node "$RUNNER_TEMP/snapshot.js" > "$RUNNER_TEMP/after.json"
+            npm audit --json > "$RUNNER_TEMP/audit.json" || true
+          fi
+
+          {
+            printf 'Auto-generated by [github-workflows][1]\n\n'
+            node "$RUNNER_TEMP/compare.js" "$RUNNER_TEMP/before.json" "$RUNNER_TEMP/after.json"
+            printf '\nPackage versions added to %s: %s\n' "$lockfile" \
+              "$(comm -13 <(git show "HEAD:./$lockfile" | lock_packages) <(lock_packages < "$lockfile") | wc -l)"
+            printf '\n'
+            node "$RUNNER_TEMP/audit.js" "$RUNNER_TEMP/audit.json"
+            printf '\n[1]: https://github.com/unb-libraries/github-workflows/blob/1.x/.github/workflows/update-node.yaml\n'
+          } > "$RUNNER_TEMP/body.md"
+
+          # The tracked manifests and lockfile under this directory, as repository-root paths.
+          {
+            echo 'paths<<PATHS_EOF'
+            git ls-files --full-name -- package.json '*/package.json' "$lockfile" pnpm-workspace.yaml
+            echo 'PATHS_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+          commit-message: Update Application and Dependencies
+          committer: ${{ inputs.git-committer }}
+          author: ${{ inputs.git-author }}
+          signoff: false
+          branch: ${{ inputs.pr-branch }}
+          add-paths: ${{ steps.update.outputs.paths }}
+          delete-branch: true
+          title: 'Application Updates'
+          body-path: ${{ runner.temp }}/body.md
+          labels: |
+            automated
+            updates
+          draft: false
