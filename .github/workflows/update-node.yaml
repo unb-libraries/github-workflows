@@ -189,6 +189,8 @@ jobs:
             fi
             # The path@version of every entry in the lockfile's packages map.
             lock_packages() {
+              # ${path} is a JavaScript template literal, not a shell expansion.
+              # shellcheck disable=SC2016
               node -e 'const lock = JSON.parse(require("fs").readFileSync(0)); for (const [path, pkg] of Object.entries(lock.packages ?? {})) if (path) console.log(`${path}@${pkg.version}`);' | sort
             }
 
