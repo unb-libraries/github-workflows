@@ -26,9 +26,10 @@ next run, so nothing merges without passing `ci.yaml`.
 | `.github/workflows/deploy.yaml` | `kubectl set image` + rollout wait, per deployment, in the branch's namespace |
 | `.github/actions/build-themes` | Builds and verifies Drupal themes with the app's own dockworker |
 | `.github/actions/check-logs` | PHP-free deployment log check |
+| `.github/actions/notify-slack` | Slack, run start or conclusion, as a step |
 | `.github/workflows/ci.yaml` | This repository's own CI: actionlint, shellcheck, tests |
-| `.github/workflows/notify-start.yaml` | Slack, run start |
-| `.github/workflows/notify-conclusion.yaml` | Slack, run conclusion |
+| `.github/workflows/notify-start.yaml` | Slack, run start, as a job (wraps `notify-slack`) |
+| `.github/workflows/notify-conclusion.yaml` | Slack, run conclusion, as a job (wraps `notify-slack`) |
 | `.github/workflows/update.yaml` | Scheduled composer update pull requests, run in the application's base image |
 | `.github/workflows/update-nuxt.yaml` | Scheduled pnpm update pull requests for Nuxt applications |
 | `.github/workflows/update-ckeditor5.yaml` | Scheduled CKEditor 5 module update pull requests |

@@ -6,6 +6,7 @@ on:
       SLACK_WEBHOOK_URL:
         required: true
 
+# The message itself is .github/actions/notify-slack, which the orchestrators run as a step.
 jobs:
   slack-start:
     name: Notify of Start
@@ -14,40 +15,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Build Slack payload
-        id: payload
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          REF_NAME: ${{ github.ref_name }}
-          WORKFLOW: ${{ github.workflow }}
-          SHA: ${{ github.sha }}
-          ACTOR: ${{ github.actor }}
-          RUN_ID: ${{ github.run_id }}
-        run: |
-          COMMIT_JSON=$(gh api "repos/${REPO}/commits/${SHA}" 2>/dev/null || echo '{}')
-          MESSAGE=$(jq -r '.commit.message // ""' <<<"$COMMIT_JSON")
-          AUTHOR=$(jq -r '.commit.author.name // ""' <<<"$COMMIT_JSON")
-          [ -z "$AUTHOR" ] && AUTHOR="$ACTOR"
-          # Slack mrkdwn treats &, < and > as markup: an unescaped "<x>" in a commit message is
-          # swallowed or becomes a mention, and a stray ">" can break the <url|text> links.
-          slack_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' <<<"$1"; }
-          MESSAGE=$(slack_escape "$MESSAGE")
-          AUTHOR=$(slack_escape "$AUTHOR")
-          WORKFLOW=$(slack_escape "$WORKFLOW")
-          REF_NAME=$(slack_escape "$REF_NAME")
-          SHORT_SHA=${SHA:0:7}
-          RUN_URL="${GITHUB_SERVER_URL}/${REPO}/actions/runs/${RUN_ID}"
-          COMMIT_URL="${GITHUB_SERVER_URL}/${REPO}/commit/${SHA}"
-          # Slack mrkdwn <url|text> links: workflow name -> this run, short SHA -> the commit.
-          TEXT=$(printf '%s %s - Build Started :deployparrot: (<%s|%s>)\n<%s|%s> %s\n%s' \
-            "$REPO" "$REF_NAME" "$RUN_URL" "$WORKFLOW" "$COMMIT_URL" "$SHORT_SHA" "$MESSAGE" "$AUTHOR")
-          PAYLOAD=$(jq -cn --arg text "$TEXT" \
-            '{attachments: [{color: "warning", text: $text, mrkdwn_in: ["text"]}]}')
-          echo "json=$PAYLOAD" >> "$GITHUB_OUTPUT"
-      - uses: slackapi/slack-github-action@v3
+      - uses: unb-libraries/github-workflows/.github/actions/notify-slack@1.x
         with:
           webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
-          webhook-type: incoming-webhook
-          errors: false          # best-effort: must never block builds that gate on this job
-          payload: ${{ steps.payload.outputs.json }}
+          fail-on-error: false   # best-effort: must never block builds that gate on this job
