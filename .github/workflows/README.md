@@ -27,6 +27,26 @@ runs the application's own dockworker.
 Supporting workflows (`deploy.yaml`, `notify-start.yaml`, `notify-conclusion.yaml`) are
 called by the orchestrators and are not usually invoked directly.
 
+### Fewer, fuller jobs
+
+GitHub bills Actions by the job, each rounded **up** to a whole minute, and private
+repositories draw on the organization's monthly allowance. A job that posts to Slack for
+three seconds costs as much as a one-minute build. So `build-push-deploy-notify.yaml` runs
+its small tasks as steps inside jobs that already exist:
+
+| Job | Also does |
+|---|---|
+| `Build/Push Images / Prepare Build` | Posts the start to Slack (`build-push.yaml`'s `notify-start` input) |
+| `Build/Push Images / Build Image (<platform>)` | |
+| `Deploy New Image / Deploy New Image to Kubernetes Cluster` | Skipped on non-deploy branches |
+| `Conclude` | The log check, the conclusion to Slack, then the prune |
+
+That is four billed jobs for a single-platform deploy (formerly six, seven with
+`check-logs`) and three on a branch that does not deploy (formerly four). Keep it that way:
+add a step to one of these jobs rather than a new job, unless it needs a different runner
+or must run in parallel. `notify-start.yaml` and `notify-conclusion.yaml` remain as job
+wrappers around `.github/actions/notify-slack` for `publish-image.yaml` and outside callers.
+
 ## Recommended caller shape
 
 ```yaml
@@ -219,10 +239,10 @@ on:
 ## Deployment log check
 
 With `check-logs: true`, `build-push-deploy-notify.yaml` collects the post-rollout container
-logs (`collect-logs` is implied) and the `Check New Deployment Logs` job fails the run if any
-line is an error. It runs after a successful deploy, and after a failed one too, where it
-only displays the logs (the run is already red). It is skipped on non-deploy branches.
-`Notify Conclusion` waits for it.
+logs (`collect-logs` is implied) and the `Conclude` job fails the run if any line is an
+error. The check runs after a successful deploy, and after a failed one too, where it only
+displays the logs (the run is already red). It is skipped on non-deploy branches. Its
+verdict is included in the Slack conclusion, which is sent before the job fails.
 
 ```yaml
     with:
@@ -462,7 +482,8 @@ that artifact expired, re-run all jobs.
 
 Job timeouts: `Prepare Build` 20 minutes; `Build Image` 90 minutes, or 360 when
 `distribute: false` emulates platforms; `Merge Platform Images` 10; the deploy
-`deploy-timeout-minutes` (default 30); the log check 10; pruning 30; notifications 5.
+`deploy-timeout-minutes` (default 30); `Conclude` 40, of which the log check 10 and
+pruning 30; the job-wrapper notifications 5.
 
 Layers are pushed with `compression: zstd` by default (OCI media types), which needs
 containerd 1.5+ / Docker 23+ wherever the image is pulled. Set `compression: gzip` for older
@@ -483,9 +504,9 @@ dimension. These are the couplings that must be resolved first:
 1. **`deploy.yaml` maps one image onto N deployments.** `image-full-name` is invariant across
    the `k8s-deployment-name` CSV, and the `kubectl set image` call assumes the pod container
    name equals the deployment name. Multi-image needs a mapping structure rather than a CSV.
-2. **Pruning keys on a scalar.** The orchestrator uses
-   `concurrency: group: prune-${{ inputs.image-name }}`; matrix legs would serialize against
-   each other or collide across runs.
+2. **Pruning keys on a scalar.** The `Conclude` job prunes `inputs.image-name` once; N
+   images need one prune step per image. Prunes are not serialized: concurrent runs over one
+   image are safe, since each keeps the newest builds and every text-tagged version.
 3. **The `build-image-tag` artifact name is a literal.** Under `actions/upload-artifact@v4+`,
    two matrix legs uploading the same name is a hard failure, not a merge, and the file
    inside is always `/tmp/image_tag.env`.

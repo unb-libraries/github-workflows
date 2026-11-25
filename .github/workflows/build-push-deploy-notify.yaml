@@ -143,13 +143,6 @@ on:
         required: false
 
 jobs:
-  notify-start:
-    name: Notify Start
-    if: always()
-    uses: unb-libraries/github-workflows/.github/workflows/notify-start.yaml@1.x
-    secrets:
-      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-
   build-push-images:
     name: Build/Push Images
     uses: unb-libraries/github-workflows/.github/workflows/build-push.yaml@1.x
@@ -169,7 +162,9 @@ jobs:
       arm64-runner: ${{ inputs.arm64-runner }}
       amd64-runner: ${{ inputs.amd64-runner }}
       compression: ${{ inputs.compression }}
+      notify-start: true
     secrets:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
       GH_CONTAINER_REGISTRY_USER: ${{ secrets.GH_CONTAINER_REGISTRY_USER }}
       GH_CONTAINER_REGISTRY_TOKEN: ${{ secrets.GH_CONTAINER_REGISTRY_TOKEN }}
       GH_NPM_TOKEN: ${{ secrets.GH_NPM_TOKEN }}
@@ -191,23 +186,29 @@ jobs:
     secrets:
       KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
 
-  check-deployment-logs:
-    name: Check New Deployment Logs
-    needs: [ deploy-image-to-k8s ]
-    # Runs after a failed deploy too, to display the logs when they matter most. A job-level
-    # `if` without a status function gets success() ANDed in, which skipped it on failure.
-    # Skipped with the deploy on non-deploy branches, and on cancellation.
-    if: >-
-      ${{ !cancelled()
-          && inputs.check-logs
-          && contains(fromJSON(inputs.deploy-branches), github.ref_name)
-          && (needs.deploy-image-to-k8s.result == 'success' || needs.deploy-image-to-k8s.result == 'failure') }}
+  # Everything after the deploy, in one job: GitHub bills every job by the minute, rounded up,
+  # and the log check, the prune and the Slack message each take seconds. Runs whatever
+  # happened before it, so the conclusion is always reported.
+  conclude:
+    name: Conclude
+    needs: [ build-push-images, deploy-image-to-k8s ]
+    if: always()
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # The prune's own allowance, plus the log check and the notification.
+    timeout-minutes: 40
+    env:
+      # The log check runs after a successful deploy, and after a failed one too, to display
+      # the logs when they matter most. Skipped with the deploy on non-deploy branches, and on
+      # cancellation.
+      CHECK_LOGS: >-
+        ${{ inputs.check-logs
+            && contains(fromJSON(inputs.deploy-branches), github.ref_name)
+            && (needs.deploy-image-to-k8s.result == 'success' || needs.deploy-image-to-k8s.result == 'failure') }}
     steps:
       -
         name: Retrieve The Log Artifact
         id: download
+        if: ${{ !cancelled() && env.CHECK_LOGS == 'true' }}
         # A deploy can fail before it collects logs (e.g. an unmapped branch), leaving none.
         continue-on-error: true
         uses: actions/download-artifact@v8
@@ -216,8 +217,12 @@ jobs:
           path: /tmp/logs
       -
         name: Check Logs for Errors
+        id: check-logs
         # A failed deploy is already red; scanning its logs would only add a second failure.
-        if: ${{ needs.deploy-image-to-k8s.result == 'success' && steps.download.outcome == 'success' }}
+        # continue-on-error so the conclusion below is still sent; the last step fails the job.
+        if: ${{ !cancelled() && env.CHECK_LOGS == 'true' && needs.deploy-image-to-k8s.result == 'success' && steps.download.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 10
         uses: unb-libraries/github-workflows/.github/actions/check-logs@1.x
         with:
           log-file: /tmp/logs/deployment_logs.txt
@@ -225,38 +230,39 @@ jobs:
           extra-exceptions: ${{ inputs.log-check-exceptions }}
       -
         name: Display Full Logs
-        # Without always() this is skipped exactly when the check fails, which is the only
-        # time the logs are needed. The fallback keeps a missing artifact from adding a
-        # second, misleading failure.
-        if: always()
+        # The fallback keeps a missing artifact from adding a second, misleading failure.
+        if: ${{ !cancelled() && env.CHECK_LOGS == 'true' }}
         run: cat /tmp/logs/deployment_logs.txt || echo "No log file at /tmp/logs/deployment_logs.txt"
         shell: bash
-
-  prune-old-images:
-    name: Prune Old Images
-    needs: [ deploy-image-to-k8s ]
-    if: ${{ success() && contains(fromJSON(inputs.deploy-branches), github.ref_name) }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    continue-on-error: true
-    concurrency:
-      group: prune-${{ inputs.image-name }}
-      cancel-in-progress: false
-    steps:
-      - uses: unb-libraries/container-image-pruner@v1
+      -
+        name: Notify of Conclusion
+        if: always()
+        uses: unb-libraries/github-workflows/.github/actions/notify-slack@1.x
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          conclusion: >-
+            ${{ (contains(needs.*.result, 'failure') || steps.check-logs.outcome == 'failure') && 'failure'
+                || contains(needs.*.result, 'cancelled') && 'cancelled'
+                || 'success' }}
+          # Terminal step: fail loudly so a broken payload or webhook is visible.
+          fail-on-error: true
+      -
+        name: Prune Old Images
+        # Best-effort and after the notification, so a slow prune never delays it. Concurrent
+        # prunes of one image are safe: each keeps the newest builds and every text-tagged
+        # version, and a version the other run already deleted fails this best-effort step only.
+        if: ${{ !cancelled() && needs.deploy-image-to-k8s.result == 'success' && contains(fromJSON(inputs.deploy-branches), github.ref_name) }}
+        continue-on-error: true
+        timeout-minutes: 30
+        uses: unb-libraries/container-image-pruner@v1
         with:
           image-name: ${{ inputs.image-name }}
           token: ${{ secrets.GH_CONTAINER_REGISTRY_TOKEN }}
           max-delete: 1500
-
-  notify-conclusion:
-    name: Notify Conclusion
-    uses: unb-libraries/github-workflows/.github/workflows/notify-conclusion.yaml@1.x
-    # Waits for every job that decides the outcome. Prune Old Images is best-effort
-    # (continue-on-error) and deliberately excluded.
-    needs: [ build-push-images, deploy-image-to-k8s, check-deployment-logs ]
-    if: always()
-    with:
-      conclusion: ${{ contains(needs.*.result, 'failure') && 'failure' || contains(needs.*.result, 'cancelled') && 'cancelled' || 'success' }}
-    secrets:
-      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      -
+        name: Fail On Log Errors
+        if: ${{ !cancelled() && steps.check-logs.outcome == 'failure' }}
+        run: |
+          echo "::error title=Deployment logs::The post-rollout container logs contain error lines. See Check Logs for Errors."
+          exit 1
+        shell: bash

@@ -93,6 +93,14 @@ on:
         required: false
         type: string
         default: zstd
+      notify-start:
+        description: >-
+          Post the run's start to Slack (the SLACK_WEBHOOK_URL secret) as the first step of
+          Prepare Build rather than in a job of its own: GitHub bills every job by the minute,
+          rounded up. Best-effort: never fails the build. Default false.
+        required: false
+        type: boolean
+        default: false
 
     outputs:
       image-tag:
@@ -115,12 +123,16 @@ on:
           npmrc build secret (empty without a token), so a Dockerfile can use
           --mount=type=secret,id=npmrc unconditionally.
         required: false
+      SLACK_WEBHOOK_URL:
+        description: 'Slack incoming webhook URL. Used only with notify-start.'
+        required: false
 
 jobs:
   # Computes the tags once (so every platform job and the merge share one timestamp), plans
   # one build job per platform, and builds architecture-neutral assets (themes, the
-  # pre-build command) once for all of them. Must not reference secrets: job outputs that may
-  # contain a secret value are silently dropped by the runner.
+  # pre-build command) once for all of them. Must not reference a secret whose value could
+  # appear in an output: job outputs that contain a secret value are silently dropped by the
+  # runner. The Slack webhook URL, used only by the notify step, cannot appear in any of them.
   prepare:
     name: Prepare Build
     runs-on: ubuntu-latest
@@ -134,6 +146,13 @@ jobs:
       multi: ${{ steps.plan-platforms.outputs.multi }}
       count: ${{ steps.plan-platforms.outputs.count }}
     steps:
+      -
+        name: Notify of Start
+        if: inputs.notify-start
+        continue-on-error: true
+        uses: unb-libraries/github-workflows/.github/actions/notify-slack@1.x
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
       -
         name: Resolve Image Tags
         id: image-tag
